@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 )
 
-var DEBUG = false
+var DEBUG = true
 
 var ProjectDir string
 var SessionsDir string

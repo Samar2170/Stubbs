@@ -1,18 +1,14 @@
 package env
 
 import (
+	"context"
 	"stubbs/src/types"
-	"time"
 )
 
+const DefaultTimeout = 300
+
 type Environment interface {
-	Execute(action types.ToolCall, cwd string, timeout int) ExecutionOutput
-}
-type ExecutionOutput struct {
-	Output   string
-	Error    string
-	Code     int
-	Duration time.Duration
+	Execute(ctx context.Context, action types.ToolCall) types.ExecutionOutput
 }
 
 type EnvironmentConfig struct {

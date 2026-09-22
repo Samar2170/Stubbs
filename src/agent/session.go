@@ -3,7 +3,6 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -23,31 +22,32 @@ type Session struct {
 }
 
 type sessionRecord struct {
-	Timestamp time.Time `json:"timestamp"`
-	Type      string    `json:"type"`
-	Content   string    `json:"content"`
-	Model     string    `json:"model"`
+	Timestamp  time.Time `json:"timestamp"`
+	Type       string    `json:"type"`
+	Content    string    `json:"content"`
+	ToolCallID string    `json:"tool_call_id,omitempty"`
+	Model      string    `json:"model"`
 }
 
 func randomUint() uint {
 	return rand.Uint()
 }
 
-func newSession(model string, systemMsg string) *Session {
+func newSession(model string, systemMsg string) (*Session, error) {
 	session := &Session{
 		Id: randomUint(),
 		Messages: []types.Message{
-			{Role: "system", Content: systemMsg},
+			{Role: types.RoleSystem, Content: systemMsg},
 		},
 		CreatedAt: time.Now(),
 		model:     model,
 	}
-	f, err := os.OpenFile(filepath.Join(config.SessionsDir, fmt.Sprintf("session_%d.jsonl", session.Id)), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(filepath.Join(config.SessionsDir, fmt.Sprintf("session_%d.jsonl", session.Id)), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
-		log.Fatalf("Failed to open session file: %v", err)
+		return nil, err
 	}
 	session.w = f
-	return session
+	return session, nil
 }
 
 func (s *Session) Append(msg types.Message) error {
@@ -57,14 +57,14 @@ func (s *Session) Append(msg types.Message) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Messages = append(s.Messages, msg)
-	rec := sessionRecord{Timestamp: time.Now(), Type: msg.Role, Content: msg.Content, Model: s.model}
+	rec := sessionRecord{Timestamp: time.Now(), Type: msg.Role, Content: msg.Content, ToolCallID: msg.ToolCallID, Model: s.model}
 	line, err := json.Marshal(rec)
 	if err != nil {
-		log.Fatalf("Failed to marshal session record: %v", err)
+		return fmt.Errorf("marshal session record: %w", err)
 	}
 	_, err = s.w.Write(append(line, '\n'))
 	if err != nil {
-		log.Fatalf("Failed to write session record: %v", err)
+		return fmt.Errorf("write session record: %w", err)
 	}
 	return s.w.Sync()
 

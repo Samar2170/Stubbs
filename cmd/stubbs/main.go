@@ -17,19 +17,20 @@ func main() {
 	registry := types.NewRegistry()
 	bashTool := tools.NewBashTool()
 	registry.Register(bashTool)
-	client := llm.NewORClient(cfg.APIKey, []string{
-		cfg.Model,
-	},
-		*registry,
-	)
-
+	client := llm.NewORClient(cfg.APIKey, []string{cfg.Model}, registry)
 	agentConfig := &agent.AgentConfig{
-		InstanceTemplate: "",
-		StepLimit:        24,
-		CostLimit:        5,
+		StepLimit: 24,
+		CostLimit: 5,
 	}
-	env := env.NewLocalEnvironment(".", "", 300)
-	a := agent.NewAgent(agentConfig, []types.Tool{bashTool}, client, env, cfg.Model)
+	env := env.NewLocalEnvironment(env.EnvironmentConfig{Timeout: 300}, registry)
+	a, err := agent.NewAgent(agentConfig, client, env, cfg.Model)
+	if err != nil {
+		panic(err)
+	}
 	ctx := context.Background()
-	a.Run(ctx, "List files in the current working directory")
+	output, err := a.Run(ctx, "GIve me a snapshot of what processes are running on my machine, whats using a lot of CPU and RAM")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(output)
 }

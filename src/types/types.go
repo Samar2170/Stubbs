@@ -16,10 +16,10 @@ type FunctionSpec struct {
 type ToolCall struct {
 	ID       string       `json:"id"`
 	Type     string       `json:"type"`
-	Function functionCall `json:"function"`
+	Function FunctionCall `json:"function"`
 }
 
-type functionCall struct {
+type FunctionCall struct {
 	Name string `json:"name"`
 	// Arguments is the JSON-encoded argument string, e.g. {"command":"ls -la"}.
 	Arguments string `json:"arguments"`

@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"stubbs/src/types"
@@ -12,6 +14,7 @@ import (
 )
 
 const defaultBaseURL = "https://openrouter.ai/api/v1"
+const maxAttempts = 3
 
 type ORClient struct {
 	apiKey    string
@@ -19,8 +22,7 @@ type ORClient struct {
 	maxTokens int
 	baseURL   string
 	hc        *http.Client
-	// Session   *Session
-	Tools []types.Tool
+	Tools     []types.Tool
 }
 
 type ORChatRequest struct {
@@ -30,28 +32,33 @@ type ORChatRequest struct {
 	Tools     []types.ToolDefinition `json:"tools,omitempty"`
 }
 
-type chatUsage struct {
+type Usage struct {
 	PromptTokens     int     `json:"prompt_tokens"`
 	CompletionTokens int     `json:"completion_tokens"`
 	TotalTokens      int     `json:"total_tokens"`
 	Cost             float32 `json:"cost"`
 }
 
-// map[choices:[map[finish_reason:tool_calls index:0 logprobs:<nil> message:map[content:<nil> reasoning:The user wants me to list files in the current working directory. I'll use the bash tool to do this. reasoning_details:[map[format:unknown index:0 text:The user wants me to list files in the current working directory. I'll use the bash tool to do this. type:reasoning.text]] refusal:<nil> role:assistant tool_calls:[map[function:map[arguments:{"command":"ls -la"} name:bash] id:call_01a0c80d35917cb3931eebe5 index:0 type:function]]] native_finish_reason:tool_calls]] created:1.790062703e+09 id:gen-1790062703-I6zUKD8au7yLDyVVTKuK model:z-ai/glm-5.3-flash object:chat.completion provider:Together service_tier:<nil> system_fingerprint:default usage:map[completion_tokens:36 completion_tokens_details:map[audio_tokens:0 image_tokens:0 reasoning_tokens:23] cost:3.399e-05 cost_details:map[upstream_inference_completions_cost:1.8e-05 upstream_inference_cost:3.399e-05 upstream_inference_prompt_cost:1.599e-05] is_byok:false prompt_tokens:209 prompt_tokens_details:map[audio_tokens:0 cache_write_tokens:0 cached_tokens:128 video_tokens:0] total_tokens:245]]
+type ResponseMessage struct {
+	Role      string           `json:"role"`
+	Content   string           `json:"content"`
+	ToolCalls []types.ToolCall `json:"tool_calls,omitempty"`
+}
+
+type Choice struct {
+	Message      ResponseMessage `json:"message"`
+	FinishReason string          `json:"finish_reason"`
+}
+
+type ResponseError struct {
+	Message string `json:"message"`
+	Code    int    `json:"code"`
+}
 
 type ORChatResponse struct {
-	Choices []struct {
-		Message struct {
-			Content   string           `json:"content"`
-			Reasoning string           `json:"reasoning,omitempty"`
-			ToolCalls []types.ToolCall `json:"tool_calls,omitempty"`
-		} `json:"message"`
-	} `json:"choices"`
-	Usage *chatUsage `json:"usage,omitempty"`
-	Error *struct {
-		Message string `json:"message"`
-		Code    int    `json:"code"`
-	} `json:"error,omitempty"`
+	Choices []Choice       `json:"choices"`
+	Usage   *Usage         `json:"usage,omitempty"`
+	Error   *ResponseError `json:"error,omitempty"`
 }
 
 func (cr *ORChatResponse) String() string {
@@ -85,7 +92,7 @@ func WithBaseURL(u string) Option {
 	return func(c *ORClient) { c.baseURL = u }
 }
 
-func NewORClient(apiKey string, modelIDs []string, toolRegistry types.Registry, opts ...Option) *ORClient {
+func NewORClient(apiKey string, modelIDs []string, toolRegistry *types.Registry, opts ...Option) *ORClient {
 	if len(modelIDs) == 0 {
 		modelIDs = []string{"z-ai/glm-5.3-flash"}
 	}
@@ -94,7 +101,9 @@ func NewORClient(apiKey string, modelIDs []string, toolRegistry types.Registry, 
 		models:  modelIDs,
 		baseURL: defaultBaseURL,
 		hc:      &http.Client{Timeout: 3 * time.Minute},
-		Tools:   toolRegistry.List(),
+	}
+	if toolRegistry != nil {
+		c.Tools = toolRegistry.List()
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -124,22 +133,40 @@ func (c *ORClient) CompleteText(ctx context.Context, messages []types.Message) (
 	if c == nil {
 		return ORChatResponse{}, fmt.Errorf("client is nil")
 	}
-	resp, err := c.query(ctx, c.models[0], messages)
-	if err != nil {
-		return ORChatResponse{}, err
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-time.After(time.Duration(1<<(attempt-1)) * time.Second):
+			case <-ctx.Done():
+				return ORChatResponse{}, ctx.Err()
+			}
+		}
+		resp, err := c.query(ctx, c.models[0], messages)
+		if err == nil {
+			if resp.Error != nil {
+				lastErr = fmt.Errorf("openrouter: %s (code %d)", resp.Error.Message, resp.Error.Code)
+				continue
+			}
+			if len(resp.Choices) == 0 {
+				lastErr = fmt.Errorf("openrouter: response has no choices")
+				continue
+			}
+			return resp, nil
+		}
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) || !apiErr.Retryable() {
+			return ORChatResponse{}, err
+		}
+		lastErr = err
 	}
-	if len(resp.Choices) == 0 {
-		return resp, fmt.Errorf("openrouter: response has no choices")
-	}
-
-	return resp, nil
+	return ORChatResponse{}, fmt.Errorf("openrouter: giving up after %d attempts: %w", maxAttempts, lastErr)
 }
 
 func (c *ORClient) query(ctx context.Context, model string, messages []types.Message) (ORChatResponse, error) {
 	var chatResp ORChatResponse
-	toolDefs := c.toolDefinitions()
 	payload, err := json.Marshal(ORChatRequest{
-		Model: model, Messages: messages, MaxTokens: c.maxTokens, Tools: toolDefs,
+		Model: model, Messages: messages, MaxTokens: c.maxTokens, Tools: c.toolDefinitions(),
 	})
 	if err != nil {
 		return chatResp, err
@@ -155,18 +182,14 @@ func (c *ORClient) query(ctx context.Context, model string, messages []types.Mes
 		return chatResp, err
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		return chatResp, fmt.Errorf("openrouter API error:%d %s", response.StatusCode, response.Status)
-	}
-	// debugResponse := make(map[string]interface{})
-	// if err := json.NewDecoder(response.Body).Decode(&debugResponse); err != nil {
-	// 	return chatResp, err
-	// }
-	// fmt.Println(debugResponse)
 
-	var result ORChatResponse
-	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 4<<10))
+		return chatResp, &APIError{Status: response.StatusCode, Body: string(body)}
+	}
+	if err := json.NewDecoder(response.Body).Decode(&chatResp); err != nil {
 		return chatResp, err
 	}
-	return result, nil
+	return chatResp, nil
+
 }

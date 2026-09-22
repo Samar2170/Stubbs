@@ -3,20 +3,23 @@ package types
 import (
 	"context"
 	"encoding/json"
+	"time"
 )
+
+type ExecutionOutput struct {
+	Output   string
+	Error    string
+	Code     int
+	Duration time.Duration
+}
 
 type Tool interface {
 	Name() string
 	Description() string
 	Parameters() json.RawMessage
-	Execute(ctx context.Context, args string) (json.RawMessage, error)
+	Execute(ctx context.Context, args string) ExecutionOutput
 }
 
-type Function struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	Parameters  map[string]any `json:"parameters"`
-}
 type Registry struct {
 	tools map[string]Tool
 }

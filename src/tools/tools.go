@@ -1,11 +1,13 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os/exec"
 	"strings"
+	"stubbs/src/types"
 	"time"
 )
 
@@ -57,18 +59,13 @@ type bashArgs struct {
 	Command string `json:"command"`
 }
 
-type bashResult struct {
-	Output   string `json:"output"`
-	ExitCode int    `json:"exit_code"`
-}
-
-func (b *BashTool) Execute(ctx context.Context, args string) (json.RawMessage, error) {
+func (b *BashTool) Execute(ctx context.Context, args string) types.ExecutionOutput {
 	var input bashArgs
-	// if err := json.Unmarshal(args, &input); err != nil {
-	// 	return nil, fmt.Errorf("bash: bad arguments: %w", err)
-	// }
+	if err := json.Unmarshal([]byte(args), &input); err != nil {
+		return types.ExecutionOutput{Error: fmt.Sprintf("bash: bad arguments: %v", err), Code: -1}
+	}
 	if strings.TrimSpace(input.Command) == "" {
-		return nil, fmt.Errorf("bash: command cannot be empty")
+		return types.ExecutionOutput{Error: "bash: command cannot be empty", Code: -1}
 	}
 	timeout := b.Timeout
 	if timeout <= 0 {
@@ -78,16 +75,21 @@ func (b *BashTool) Execute(ctx context.Context, args string) (json.RawMessage, e
 	defer cancel()
 	cmd := exec.CommandContext(runCtx, "bash", "-c", input.Command)
 	cmd.Dir = b.Dir
-	out, err := cmd.CombinedOutput()
-	res := bashResult{
-		Output:   truncateOutput(string(out), b.maxOutput()),
-		ExitCode: exitCode(err, runCtx),
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+
+	runErr := cmd.Run()
+	out := types.ExecutionOutput{
+		Output: buf.String(),
+		Code:   exitCode(runErr, runCtx),
 	}
-	encoded, err := json.Marshal(res)
-	if err != nil {
-		return nil, fmt.Errorf("bash: failed to encode result: %w", err)
+	if runErr != nil {
+		if _, ok := runErr.(*exec.ExitError); !ok {
+			out.Error = runErr.Error()
+		}
 	}
-	return encoded, nil
+	return out
 }
 
 func (b *BashTool) maxOutput() int {

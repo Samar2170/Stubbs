@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"strings"
 	"stubbs/src/env"
 	"stubbs/src/llm"
 	"stubbs/src/types"
@@ -12,17 +13,14 @@ import (
 var SYSTEM_TEMPLATE = "You are a helpful assistant that can interact with a computer."
 
 type AgentConfig struct {
-	InstanceTemplate           string
-	StepLimit                  int
-	CostLimit                  float32
-	WalltimeLimit              int
-	MaxConsecutiveFormatErrors int
+	StepLimit     int
+	CostLimit     float32
+	WallTimeLimit int
 }
 
 type Agent struct {
 	config      *AgentConfig
 	Model       string
-	maxTokens   int
 	Tools       []types.Tool
 	ModelClient llm.ModelClient
 	StartTime   time.Time
@@ -34,44 +32,58 @@ type Agent struct {
 	Session     *Session
 }
 
-func NewAgent(config *AgentConfig, tools []types.Tool, client llm.ModelClient, environ env.Environment, model string) *Agent {
-	return &Agent{
-		config: config,
-		Model:  model,
-		// maxTokens:   maxTokens,
-		Tools:       tools,
-		ModelClient: client,
-		StartTime:   time.Now(),
-		Cost:        0,
-		Steps:       0,
-		Messages:    []types.Message{},
-		Environment: environ,
-		Session:     newSession(model, SYSTEM_TEMPLATE),
+func NewAgent(cfg *AgentConfig, client llm.ModelClient, environ env.Environment, model string) (*Agent, error) {
+	if cfg == nil {
+		cfg = &AgentConfig{}
 	}
+	if client == nil {
+		return nil, fmt.Errorf("agent: client cannot be nil")
+	}
+	s, err := newSession(model, SYSTEM_TEMPLATE)
+	if err != nil {
+		return nil, err
+	}
+	return &Agent{
+		config:      cfg,
+		Model:       model,
+		ModelClient: client,
+		Environment: environ,
+		StartTime:   time.Now(),
+		Session:     s,
+		Messages:    []types.Message{{Role: types.RoleSystem, Content: SYSTEM_TEMPLATE}},
+	}, nil
 }
 
 func (a *Agent) Run(ctx context.Context, task string) (string, error) {
-	var resp string
-	a.Messages = append(a.Messages, types.Message{Role: "user", Content: task})
-	if err := a.Session.Append(types.Message{Role: "user", Content: task}); err != nil {
-		return resp, err
+	defer a.Close()
+	if a.config.WallTimeLimit > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(a.config.WallTimeLimit)*time.Second)
+		defer cancel()
 	}
-	for a.Steps < a.config.StepLimit {
-		err := a.step(ctx)
+	if err := a.appendMessage(types.Message{Role: "user", Content: task}); err != nil {
+		return "", err
+	}
+	var resp string
+	for a.Steps < a.config.StepLimit && (a.config.CostLimit <= 0 || a.Cost <= a.config.CostLimit) {
+		content, err := a.step(ctx)
 		if err != nil {
 			return "", err
 		}
-		if a.Messages[len(a.Messages)-1].Role == "exit" {
+		if content != "" {
+			resp = content
 			break
 		}
 	}
-	a.Session.Close()
-	return "", nil
+	return resp, nil
 }
 
-func (a *Agent) appendMessage(msg types.Message) {
+func (a *Agent) appendMessage(msg types.Message) error {
+	if err := a.Session.Append(msg); err != nil {
+		return fmt.Errorf("append to session: %w", err)
+	}
 	a.Messages = append(a.Messages, msg)
-	a.Session.Append(msg)
+	return nil
 }
 
 func (a *Agent) query(ctx context.Context) (llm.ORChatResponse, error) {
@@ -80,7 +92,9 @@ func (a *Agent) query(ctx context.Context) (llm.ORChatResponse, error) {
 		return llm.ORChatResponse{}, err
 	}
 	a.ModelCalls += 1
-	a.Cost += resp.Usage.Cost
+	if resp.Usage != nil {
+		a.Cost += resp.Usage.Cost
+	}
 	return resp, nil
 }
 
@@ -88,44 +102,38 @@ func (a *Agent) getMessages() []types.Message {
 	return a.Messages
 }
 
-func (a *Agent) step(ctx context.Context) error {
+func (a *Agent) step(ctx context.Context) (string, error) {
 	resp, err := a.query(ctx)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if len(resp.Choices) == 0 {
-		return fmt.Errorf("agent: model response has no choices")
+		return "", fmt.Errorf("agent: model response has no choices")
 	}
-	a.appendMessage(
-		types.Message{
-			Role:    types.RoleAssistant,
-			Content: resp.Choices[0].Message.Content,
-		},
-	)
-	outputs := []string{}
-	for _, choice := range resp.Choices {
-		if len(choice.Message.ToolCalls) > 0 {
-			for _, call := range choice.Message.ToolCalls {
-				excOutput := a.Environment.Execute(call, ".", 500)
-				if excOutput.Error != "" {
-					outputs = append(outputs, excOutput.Error)
-				} else {
-					outputs = append(outputs, excOutput.Output)
-				}
-			}
+	choice := resp.Choices[0]
+	assistant := types.Message{
+		Role:      types.RoleAssistant,
+		Content:   choice.Message.Content,
+		ToolCalls: choice.Message.ToolCalls,
+	}
+	if err := a.appendMessage(assistant); err != nil {
+		return "", err
+	}
+	if len(assistant.ToolCalls) == 0 {
+		return assistant.Content, nil
+	}
+	for _, call := range assistant.ToolCalls {
+		out := a.Environment.Execute(ctx, call)
+		if err := a.appendMessage(types.Message{
+			Role:       types.RoleTool,
+			Content:    renderExecution(out),
+			ToolCallID: call.ID,
+			Name:       call.Function.Name,
+		}); err != nil {
+			return "", err
 		}
 	}
-	fmt.Println(outputs)
-
-	for _, op := range outputs {
-		a.appendMessage(
-			types.Message{
-				Role:    types.RoleTool,
-				Content: op,
-			},
-		)
-	}
-	return nil
+	return "", nil
 }
 
 func (a *Agent) prepareMessage(message types.Message) []types.Message {
@@ -133,6 +141,21 @@ func (a *Agent) prepareMessage(message types.Message) []types.Message {
 		return nil
 	}
 	return a.Session.History()
+}
+
+func renderExecution(out types.ExecutionOutput) string {
+	var b strings.Builder
+	b.WriteString(out.Output)
+	if out.Error != "" {
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(out.Error)
+	}
+	if out.Code != 0 {
+		fmt.Fprintf(&b, "\n[exit code: %d]", out.Code)
+	}
+	return b.String()
 }
 
 func (a *Agent) Close() error {
