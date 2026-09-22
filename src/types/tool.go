@@ -1,0 +1,44 @@
+package types
+
+import (
+	"context"
+	"encoding/json"
+)
+
+type Tool interface {
+	Name() string
+	Description() string
+	Parameters() json.RawMessage
+	Execute(ctx context.Context, args string) (json.RawMessage, error)
+}
+
+type Function struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  map[string]any `json:"parameters"`
+}
+type Registry struct {
+	tools map[string]Tool
+}
+
+func NewRegistry() *Registry {
+	return &Registry{
+		tools: make(map[string]Tool),
+	}
+}
+
+func (r *Registry) Register(tool Tool) {
+	r.tools[tool.Name()] = tool
+}
+
+func (r *Registry) Get(name string) (Tool, bool) {
+	tool, ok := r.tools[name]
+	return tool, ok
+}
+func (r *Registry) List() []Tool {
+	tools := make([]Tool, 0, len(r.tools))
+	for _, tool := range r.tools {
+		tools = append(tools, tool)
+	}
+	return tools
+}
