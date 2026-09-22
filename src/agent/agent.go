@@ -103,6 +103,7 @@ func (a *Agent) getMessages() []types.Message {
 }
 
 func (a *Agent) step(ctx context.Context) (string, error) {
+	a.Steps++
 	resp, err := a.query(ctx)
 	if err != nil {
 		return "", err
