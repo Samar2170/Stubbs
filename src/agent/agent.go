@@ -65,6 +65,7 @@ func (a *Agent) Run(ctx context.Context, task string) (string, error) {
 			break
 		}
 	}
+	a.Session.Close()
 	return "", nil
 }
 
@@ -114,6 +115,8 @@ func (a *Agent) step(ctx context.Context) error {
 			}
 		}
 	}
+	fmt.Println(outputs)
+
 	for _, op := range outputs {
 		a.appendMessage(
 			types.Message{

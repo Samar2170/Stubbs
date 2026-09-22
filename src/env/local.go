@@ -45,10 +45,14 @@ func (le *LocalEnvironment) Execute(action types.ToolCall, wd string, timeout in
 	fmt.Println("command:", command)
 	st := time.Now()
 	result, exitCode, runErr := run(command, cwd, timeout)
+	var errMsg string
+	if runErr != nil {
+		errMsg = runErr.Error()
+	}
 	output := ExecutionOutput{
 		Output:   result,
 		Code:     exitCode,
-		Error:    runErr.Error(),
+		Error:    errMsg,
 		Duration: time.Now().Sub(st),
 	}
 	return output
