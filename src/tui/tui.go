@@ -223,7 +223,7 @@ type model struct {
 	height   int
 	lines    []string
 	vp       viewport.Model
-	ta       textarea.Textarea
+	ta       textarea.Model
 	status   string
 	mode     agent.Mode
 	steps    int
@@ -233,7 +233,7 @@ type model struct {
 	done     bool
 }
 
-func newTextarea() textarea.Textarea {
+func newTextarea() textarea.Model {
 	ta := textarea.New()
 	ta.Placeholder = idlePlaceholder
 	ta.Prompt = ""

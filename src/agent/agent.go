@@ -124,7 +124,7 @@ func (a *Agent) respond(ctx context.Context) (types.Message, error) {
 }
 
 func (a *Agent) executeRuns(ctx context.Context, calls []types.ToolCall) ([]types.ExecutionOutput, error) {
-	outputs := make([]types.ExecutionOutput, len(calls))
+	outputs := make([]types.ExecutionOutput, 0, len(calls))
 	for _, call := range calls {
 		out := a.Environment.Execute(ctx, call)
 		outputs = append(outputs, out)
