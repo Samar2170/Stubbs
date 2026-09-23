@@ -102,37 +102,54 @@ func (a *Agent) getMessages() []types.Message {
 	return a.Messages
 }
 
-func (a *Agent) step(ctx context.Context) (string, error) {
+func (a *Agent) respond(ctx context.Context) (types.Message, error) {
 	a.Steps++
 	resp, err := a.query(ctx)
 	if err != nil {
-		return "", err
+		return types.Message{}, err
 	}
 	if len(resp.Choices) == 0 {
-		return "", fmt.Errorf("agent: model response has no choices")
+		return types.Message{}, fmt.Errorf("agent: model response has no choices")
 	}
 	choice := resp.Choices[0]
-	assistant := types.Message{
+	msg := types.Message{
 		Role:      types.RoleAssistant,
 		Content:   choice.Message.Content,
 		ToolCalls: choice.Message.ToolCalls,
 	}
-	if err := a.appendMessage(assistant); err != nil {
-		return "", err
+	if err := a.appendMessage(msg); err != nil {
+		return types.Message{}, err
 	}
-	if len(assistant.ToolCalls) == 0 {
-		return assistant.Content, nil
-	}
-	for _, call := range assistant.ToolCalls {
+	return msg, nil
+}
+
+func (a *Agent) executeRuns(ctx context.Context, calls []types.ToolCall) ([]types.ExecutionOutput, error) {
+	outputs := make([]types.ExecutionOutput, len(calls))
+	for _, call := range calls {
 		out := a.Environment.Execute(ctx, call)
+		outputs = append(outputs, out)
 		if err := a.appendMessage(types.Message{
 			Role:       types.RoleTool,
 			Content:    renderExecution(out),
 			ToolCallID: call.ID,
 			Name:       call.Function.Name,
 		}); err != nil {
-			return "", err
+			return outputs, err
 		}
+	}
+	return outputs, nil
+}
+
+func (a *Agent) step(ctx context.Context) (string, error) {
+	msg, err := a.respond(ctx)
+	if err != nil {
+		return "", err
+	}
+	if len(msg.ToolCalls) == 0 {
+		return msg.Content, nil
+	}
+	if _, err := a.executeRuns(ctx, msg.ToolCalls); err != nil {
+		return "", err
 	}
 	return "", nil
 }
