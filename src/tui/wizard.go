@@ -20,6 +20,7 @@ type wizardStep struct {
 
 type wizard struct {
 	cfg     config.StubbsConfig
+	st      styles
 	step    int
 	steps   []wizardStep
 	input   textinput.Model
@@ -43,6 +44,7 @@ func newWizard(cfg config.StubbsConfig, hasKeyFromEnv bool) wizard {
 	ti.Width = 50
 	w := wizard{
 		cfg:    cfg,
+		st:     newStyles(loadTheme(cfg.Theme)),
 		steps:  steps,
 		input:  ti,
 		values: make([]string, len(steps)),
@@ -126,14 +128,26 @@ func (w wizard) valid(value string) bool {
 
 func (w wizard) View() string {
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("Welcome to stubbs!") + "\n")
-	b.WriteString(dimStyle.Render("Configure OpenRouter access. Saved to " + config.ProjectConfigFile + "\n\n"))
-	fmt.Fprintf(&b, "[%d/%d] %s\n", w.step+1, len(w.steps), w.steps[w.step].title)
+	b.WriteString(w.st.title.Render("stubbs") + " " + w.st.agent.Render("Welcome to stubbs!") + "\n")
+	b.WriteString(w.st.faint.Render("Configure OpenRouter access. Saved to "+config.ProjectConfigFile) + "\n\n")
+
+	dots := make([]string, len(w.steps))
+	for i := range w.steps {
+		switch {
+		case i < w.step:
+			dots[i] = w.st.ok.Render("●")
+		case i == w.step:
+			dots[i] = w.st.agent.Render("●")
+		default:
+			dots[i] = w.st.faint.Render("○")
+		}
+	}
+	fmt.Fprintf(&b, "%s %s\n", strings.Join(dots, " "), w.st.dim.Render(w.steps[w.step].title))
 	b.WriteString(w.input.View() + "\n")
 	if w.errMsg != "" {
-		b.WriteString(infoStyle.Render(w.errMsg) + "\n")
+		b.WriteString(w.st.errStyle.Render("● "+w.errMsg) + "\n")
 	}
-	b.WriteString(dimStyle.Render("\nenter next · esc abort"))
+	b.WriteString(w.st.faint.Render("\nenter next · esc abort"))
 	return b.String()
 }
 

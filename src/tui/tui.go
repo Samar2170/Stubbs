@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"time"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -26,12 +26,13 @@ const (
 	inExit
 	inTask
 	inLimits
+	inReject
 )
 
 type inputResult struct {
 	text        string
 	interrupted bool // ctrl-c while this prompt was pending
-	aborted     bool // ctrl-c at comment/limits prompt: abort the run
+	aborted     bool // ctrl-c at comment/limits/reject prompt: abort the run
 	cancelled   bool // "q" at the limits prompt: end the run
 }
 
@@ -41,7 +42,7 @@ type pendingInput struct {
 	reply chan inputResult
 }
 
-type lineMsg string
+type blockMsg struct{ b block }
 type statusMsg string
 type headerMsg struct {
 	steps int
@@ -49,33 +50,29 @@ type headerMsg struct {
 }
 type modeMsg agent.Mode
 type inputReqMsg struct {
-	kind  inputKind
-	title string
-	reply chan inputResult
+	kind     inputKind
+	title    string
+	commands []string
+	reply    chan inputResult
 }
 type limitsReqMsg struct {
 	curSteps, stepLimit int
 	curCost, costLimit  float32
 	reply               chan inputResult
 }
-type doneMsg string
+type doneMsg struct {
+	summary string
+	ok      bool
+}
 type autoQuitMsg struct{}
-
-var (
-	agentStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("203"))
-	userStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42"))
-	toolStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	infoStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-	dimStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
-	boxStyle   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("240"))
-)
 
 const idlePlaceholder = "Type here…  (/h for help)"
 
 type Options struct {
 	Model    string
 	AutoQuit bool
+	Theme    string
+	Mode     agent.Mode
 }
 
 // App implements agent.UI on top of a full-screen Bubble Tea program.
@@ -87,9 +84,15 @@ type App struct {
 }
 
 func New(opts Options) *App {
-	m := &model{opts: opts}
+	m := &model{
+		opts:      opts,
+		st:        newStyles(loadTheme(opts.Theme)),
+		mode:      opts.Mode,
+		showTools: true,
+	}
 	m.vp = viewport.New(80, 24)
 	m.ta = newTextarea()
+	m.sp = spinner.New(spinner.WithSpinner(spinner.MiniDot))
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	a := &App{prog: p, autoQuit: opts.AutoQuit}
 	m.app = a
@@ -112,23 +115,28 @@ func (a *App) AwaitTask() (string, error) {
 
 // Finish reports the run outcome and lets the user quit with ctrl-c.
 func (a *App) Finish(submission string, err error) {
-	var summary string
-	switch {
-	case err == nil:
-		summary = "Run complete."
-	case errors.Is(err, agent.ErrAborted):
-		summary = "Run aborted by user."
-	case errors.Is(err, agent.ErrLimitsExceeded):
-		summary = "Run ended: limits exceeded."
-	case errors.Is(err, context.Canceled):
-		summary = "Run canceled."
-	default:
-		summary = "Run failed: " + err.Error()
+	summary, ok := finishSummary(err)
+	a.prog.Send(doneMsg{summary: summary, ok: ok})
+	if s := strings.TrimSpace(submission); s != "" {
+		a.prog.Send(blockMsg{userBlock{text: s}})
 	}
-	a.prog.Send(doneMsg(summary))
-	a.prog.Send(lineMsg(dimStyle.Render(strings.TrimSpace(submission))))
 	if a.autoQuit {
 		a.prog.Send(autoQuitMsg{})
+	}
+}
+
+func finishSummary(err error) (string, bool) {
+	switch {
+	case err == nil:
+		return "Run complete.", true
+	case errors.Is(err, agent.ErrAborted):
+		return "Run aborted by user.", false
+	case errors.Is(err, agent.ErrLimitsExceeded):
+		return "Run ended: limits exceeded.", false
+	case errors.Is(err, context.Canceled):
+		return "Run canceled.", false
+	default:
+		return "Run failed: " + err.Error(), false
 	}
 }
 
@@ -137,7 +145,7 @@ func (a *App) ask(kind inputKind, title string) (string, error) {
 	a.prog.Send(inputReqMsg{kind: kind, title: title, reply: reply})
 	res := <-reply
 	switch {
-	case res.aborted || res.cancelled:
+	case res.aborted:
 		return "", agent.ErrAborted
 	case res.interrupted:
 		return "", agent.ErrInterrupted
@@ -146,33 +154,30 @@ func (a *App) ask(kind inputKind, title string) (string, error) {
 }
 
 func (a *App) Info(format string, args ...any) {
-	a.prog.Send(lineMsg(infoStyle.Render("• " + fmt.Sprintf(format, args...))))
+	a.prog.Send(blockMsg{infoBlock{text: fmt.Sprintf(format, args...)}})
 }
 
 func (a *App) Assistant(step int, cost float32, msg types.Message) {
 	a.prog.Send(headerMsg{steps: step, cost: cost})
-	a.prog.Send(lineMsg(agentStyle.Render(fmt.Sprintf("stubbs (step %d, $%.4f):", step, cost))))
-	if strings.TrimSpace(msg.Content) != "" {
-		a.prog.Send(lineMsg(msg.Content))
+	calls := make([]string, len(msg.ToolCalls))
+	for i, call := range msg.ToolCalls {
+		calls[i] = agent.CommandOf(call)
 	}
-	for _, call := range msg.ToolCalls {
-		a.prog.Send(lineMsg(userStyle.Render("→ " + agent.CommandOf(call))))
-	}
+	a.prog.Send(blockMsg{assistantBlock{
+		step:    step,
+		cost:    cost,
+		content: msg.Content,
+		calls:   calls,
+	}})
 }
 
 func (a *App) Observation(call types.ToolCall, out types.ExecutionOutput) {
-	var b strings.Builder
-	fmt.Fprintf(&b, "%s exit=%d %s",
-		toolStyle.Render(call.Function.Name),
-		out.Code,
-		dimStyle.Render(out.Duration.Round(time.Millisecond).String()))
-	if strings.TrimSpace(out.Output) != "" {
-		b.WriteString("\n" + clip(out.Output, 60))
-	}
-	if out.Error != "" {
-		b.WriteString("\n" + infoStyle.Render(clip(out.Error, 10)))
-	}
-	a.prog.Send(lineMsg(b.String()))
+	a.prog.Send(blockMsg{toolBlock{
+		name:     call.Function.Name,
+		cmd:      agent.CommandOf(call),
+		out:      out,
+		expanded: true,
+	}})
 }
 
 func (a *App) Status(text string) { a.prog.Send(statusMsg(text)) }
@@ -180,18 +185,32 @@ func (a *App) Status(text string) { a.prog.Send(statusMsg(text)) }
 func (a *App) ModeChanged(m agent.Mode) { a.prog.Send(modeMsg(m)) }
 
 func (a *App) AskConfirm(commands []string) (string, error) {
-	title := fmt.Sprintf("Execute %d command(s)?  enter=approve · text=reject · /h=help", len(commands))
-	return a.ask(inConfirm, title)
+	reply := make(chan inputResult, 1)
+	a.prog.Send(inputReqMsg{kind: inConfirm, commands: commands, reply: reply})
+	return a.await(reply)
+}
+
+func (a *App) AskExit() (string, error) {
+	reply := make(chan inputResult, 1)
+	a.prog.Send(inputReqMsg{kind: inExit, reply: reply})
+	return a.await(reply)
+}
+
+func (a *App) await(reply chan inputResult) (string, error) {
+	res := <-reply
+	switch {
+	case res.aborted:
+		return "", agent.ErrAborted
+	case res.interrupted:
+		return "", agent.ErrInterrupted
+	}
+	return res.text, nil
 }
 
 func (a *App) AskCommand() (string, error) { return a.ask(inCommand, "Your command") }
 
 func (a *App) AskComment() (string, error) {
 	return a.ask(inComment, "Comment (ctrl-c again to abort)")
-}
-
-func (a *App) AskExit() (string, error) {
-	return a.ask(inExit, "Agent wants to finish · enter=submit · text=new task · /u=human mode")
 }
 
 func (a *App) AskNewLimits(curSteps, stepLimit int, curCost, costLimit float32) (int, float32, bool, error) {
@@ -223,20 +242,29 @@ func (a *App) AskNewLimits(curSteps, stepLimit int, curCost, costLimit float32) 
 // --- bubbletea model ---
 
 type model struct {
-	opts     Options
-	app      *App
-	width    int
-	height   int
-	lines    []string
-	vp       viewport.Model
-	ta       textarea.Model
-	status   string
-	mode     agent.Mode
-	steps    int
-	cost     float32
-	pending  *pendingInput
-	expanded bool
-	done     bool
+	opts      Options
+	app       *App
+	st        styles
+	w, h      int
+	inputH    int
+	blocks    []block
+	rows      []int // cumulative transcript line count per block
+	stick     bool  // follow the bottom of the transcript
+	showTools bool  // global expand/collapse for tool output (start expanded)
+	dirty     bool
+	vp        viewport.Model
+	ta        textarea.Model
+	sp        spinner.Model
+	status    string
+	statusErr bool
+	doneOk    bool
+	mode      agent.Mode
+	steps     int
+	cost      float32
+	pending   *pendingInput
+	dlg       *dialog
+	expanded  bool
+	done      bool
 }
 
 func newTextarea() textarea.Model {
@@ -251,22 +279,24 @@ func newTextarea() textarea.Model {
 	return ta
 }
 
-func (m *model) Init() tea.Cmd { return textarea.Blink }
+func (m *model) Init() tea.Cmd {
+	return tea.Batch(textarea.Blink, m.sp.Tick)
+}
 
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		m.width, m.height = msg.Width, msg.Height
+		m.w, m.h = msg.Width, msg.Height
 		m.layout()
 		return m, nil
 
-	case lineMsg:
-		m.lines = append(m.lines, string(msg))
-		m.syncViewport()
+	case blockMsg:
+		m.appendBlock(msg.b)
 		return m, nil
 
 	case statusMsg:
 		m.status = string(msg)
+		m.statusErr = false
 		return m, nil
 
 	case headerMsg:
@@ -278,6 +308,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case inputReqMsg:
+		if msg.kind == inConfirm || msg.kind == inExit {
+			d := &dialog{reply: msg.reply}
+			if msg.kind == inConfirm {
+				d.kind, d.commands, d.options = dlgConfirm, msg.commands, confirmOptions()
+			} else {
+				d.kind, d.options = dlgExit, exitOptions()
+			}
+			m.dlg = d
+			m.layout()
+			return m, nil
+		}
 		m.pending = &pendingInput{kind: msg.kind, title: msg.title, reply: msg.reply}
 		m.ta.Placeholder = m.placeholderFor(msg.kind)
 		m.ta.Reset()
@@ -286,7 +327,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case limitsReqMsg:
 		m.pending = &pendingInput{kind: inLimits, title: "Raise limits", reply: msg.reply}
-		m.ta.Placeholder = fmt.Sprintf("new limits, e.g. '%d %.2f'  ·  q to end run", msg.stepLimit, msg.costLimit)
+		m.ta.Placeholder = fmt.Sprintf("new limits, e.g. '%d %.2f'  ·  q ends the run", msg.stepLimit, msg.costLimit)
 		m.ta.Reset()
 		m.ta.Focus()
 		return m, textarea.Blink
@@ -294,13 +335,34 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case doneMsg:
 		m.done = true
 		m.pending = nil
-		m.status = string(msg)
+		m.dlg = nil
+		m.status = msg.summary
+		m.doneOk = msg.ok
+		m.statusErr = !msg.ok
 		m.ta.Reset()
 		m.ta.Blur()
+		if msg.ok {
+			m.appendBlock(okBlock{text: msg.summary})
+		} else {
+			m.appendBlock(errorBlock{text: msg.summary})
+		}
 		return m, nil
 
 	case autoQuitMsg:
 		return m, tea.Quit
+
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.sp, cmd = m.sp.Update(msg)
+		return m, cmd
+
+	case tea.MouseMsg:
+		var cmd tea.Cmd
+		m.vp, cmd = m.vp.Update(msg)
+		if msg.Type == tea.MouseLeft && msg.Action == tea.MouseActionPress {
+			m.toggleBlockAt(msg.Y - 1) // -1: header row
+		}
+		return m, cmd
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
@@ -308,31 +370,49 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	var cmds []tea.Cmd
 	var cmd tea.Cmd
-	m.ta, cmd = m.ta.Update(msg)
-	cmds = append(cmds, cmd)
+	if m.dlg == nil {
+		m.ta, cmd = m.ta.Update(msg)
+		cmds = append(cmds, cmd)
+	}
 	m.vp, cmd = m.vp.Update(msg)
 	cmds = append(cmds, cmd)
+	if !m.vp.AtBottom() {
+		m.stick = false // the user scrolled up; stop auto-follow
+	}
 	return m, tea.Batch(cmds...)
 }
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.dlg != nil {
+		return m.handleDialogKey(msg.String())
+	}
 	switch msg.String() {
 	case "ctrl+c":
 		if m.done {
 			return m, tea.Quit
 		}
-		if m.pending != nil {
-			res := inputResult{interrupted: true}
-			if m.pending.kind == inComment || m.pending.kind == inLimits {
-				res = inputResult{aborted: true}
-			}
-			m.resolve(res)
+		return m.interruptKey()
+
+	case "esc":
+		if m.done {
 			return m, nil
 		}
-		if m.app != nil && m.app.interrupt != nil {
-			m.app.interrupt()
-			m.status = "interrupting — tell the agent what happened…"
+		return m.interruptKey()
+
+	case "ctrl+o":
+		m.showTools = !m.showTools
+		for i, b := range m.blocks {
+			if tb, ok := b.(toolBlock); ok {
+				tb.expanded = m.showTools
+				m.blocks[i] = tb
+			}
 		}
+		m.dirty = true
+		return m, nil
+
+	case "ctrl+e":
+		m.expanded = !m.expanded
+		m.layout()
 		return m, nil
 
 	case "enter":
@@ -340,18 +420,130 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.submitPending()
 			return m, nil
 		}
-		m.status = "agent is busy — press ctrl-c to interrupt"
-		return m, nil
-
-	case "ctrl+e":
-		m.expanded = !m.expanded
-		m.layout()
+		if !m.done {
+			m.status = "agent is busy — ctrl-c interrupts"
+		}
 		return m, nil
 	}
 
 	var cmd tea.Cmd
 	m.ta, cmd = m.ta.Update(msg) // ctrl+j inserts a newline
 	return m, cmd
+}
+
+func (m *model) handleDialogKey(key string) (tea.Model, tea.Cmd) {
+	d := m.dlg
+	switch key {
+	case "ctrl+c":
+		if m.done {
+			return m, tea.Quit
+		}
+		if d.reply != nil {
+			m.resolveReply(d.reply, inputResult{interrupted: true})
+		} else {
+			m.dlg = nil
+		}
+		return m, nil
+
+	case "esc":
+		switch d.kind {
+		case dlgHelp:
+			m.dlg = nil
+		case dlgConfirm:
+			m.swapComposer(inReject, "Rejecting — what went wrong?", "what should the agent do instead? · ctrl-c=abort")
+		default: // exit: esc finishes
+			m.resolveReply(d.reply, inputResult{})
+		}
+		return m, nil
+
+	case "up", "k":
+		d.selected = (d.selected + len(d.options) - 1) % len(d.options)
+		return m, nil
+
+	case "down", "j", "tab":
+		d.selected = (d.selected + 1) % len(d.options)
+		return m, nil
+
+	case "enter":
+		if d.kind == dlgHelp {
+			m.dlg = nil
+			return m, nil
+		}
+		m.pickDialogOption()
+		return m, nil
+
+	case "y":
+		if d.kind != dlgHelp {
+			d.selected = 0
+			m.pickDialogOption()
+		}
+		return m, nil
+
+	case "n":
+		if d.kind == dlgExit {
+			d.selected = 1
+			m.pickDialogOption()
+		}
+		return m, nil
+
+	case "h":
+		if d.kind == dlgExit {
+			d.selected = 2
+			m.pickDialogOption()
+		}
+		return m, nil
+
+	case "q":
+		if d.kind == dlgHelp {
+			m.dlg = nil
+		}
+		return m, nil
+	}
+	return m, nil // the modal swallows everything else
+}
+
+func (m *model) pickDialogOption() {
+	d := m.dlg
+	if d.selected >= len(d.options) {
+		d.selected = 0
+	}
+	o := d.options[d.selected]
+	switch o.action {
+	case dlgReject:
+		m.swapComposer(inReject, "Rejecting — what went wrong?", m.placeholderFor(inReject))
+	case dlgNewTask:
+		m.swapComposer(inTask, "New task", m.placeholderFor(inTask))
+	default:
+		m.resolveReply(d.reply, inputResult{text: o.text})
+	}
+}
+
+// swapComposer turns the active dialog into a composer prompt that answers
+// the same pending request.
+func (m *model) swapComposer(kind inputKind, title string, placeholder string) {
+	m.pending = &pendingInput{kind: kind, title: title, reply: m.dlg.reply}
+	m.dlg = nil
+	m.ta.Reset()
+	m.ta.Placeholder = placeholder
+	m.ta.Focus()
+	m.layout()
+}
+
+func (m *model) interruptKey() (tea.Model, tea.Cmd) {
+	if m.pending != nil {
+		res := inputResult{interrupted: true}
+		switch m.pending.kind {
+		case inComment, inLimits, inReject:
+			res = inputResult{aborted: true}
+		}
+		m.resolve(res)
+		return m, nil
+	}
+	if m.app != nil && m.app.interrupt != nil {
+		m.app.interrupt()
+		m.status = "interrupting — tell the agent what happened…"
+	}
+	return m, nil
 }
 
 func (m *model) submitPending() {
@@ -367,8 +559,8 @@ func (m *model) submitPending() {
 		cost, err2 := fieldFloat(fields, 1)
 		if err1 != nil || err2 != nil || steps <= 0 || cost < 0 {
 			m.ta.Reset()
-			m.lines = append(m.lines, infoStyle.Render("• Enter '<steps> <cost>' (e.g. '24 5'), or q to end the run."))
-			m.syncViewport()
+			m.statusErr = true
+			m.status = "enter '<steps> <cost>' (e.g. '24 5'), or q to end the run"
 			return
 		}
 		m.resolve(inputResult{text: fmt.Sprintf("%d %v", steps, cost)})
@@ -381,6 +573,13 @@ func (m *model) submitPending() {
 		m.ta.Reset()
 		return
 	}
+	// TUI-side: /h opens the help overlay instead of going to the agent.
+	if strings.TrimSpace(text) == "/h" {
+		m.ta.Reset()
+		m.dlg = newHelpDialog()
+		m.layout()
+		return
+	}
 	m.resolve(inputResult{text: text})
 }
 
@@ -390,94 +589,166 @@ func (m *model) resolve(res inputResult) {
 	}
 	reply := m.pending.reply
 	m.pending = nil
-	m.status = ""
-	m.ta.Reset()
-	m.ta.Placeholder = idlePlaceholder
-	m.layout()
+	m.resetPrompt()
 	if reply != nil {
 		reply <- res
 	}
 }
 
+func (m *model) resolveReply(reply chan inputResult, res inputResult) {
+	m.resetPrompt()
+	if reply != nil {
+		reply <- res
+	}
+}
+
+func (m *model) resetPrompt() {
+	m.status = ""
+	m.statusErr = false
+	m.ta.Reset()
+	m.ta.Placeholder = idlePlaceholder
+	m.dlg = nil
+	m.layout()
+}
+
 func (m *model) placeholderFor(kind inputKind) string {
 	switch kind {
-	case inConfirm:
-		return "enter=approve · text=reject comment · /h=help"
+	case inTask:
+		return "describe the task…"
 	case inCommand:
 		return "your command · /h=help"
-	case inComment:
+	case inComment, inReject:
 		return "what should the agent do instead? · ctrl-c=abort"
-	case inExit:
-		return "enter=submit · text=new task · /u=human mode"
-	case inTask:
-		return "What do you want to do?"
 	}
 	return ""
 }
 
-func (m *model) layout() {
-	if m.width == 0 {
+func (m *model) toggleBlockAt(y int) {
+	if y < 0 {
 		return
 	}
-	inputH := 1
-	if m.expanded {
-		inputH = 8
+	row := m.vp.YOffset + y
+	for i, end := range m.rows {
+		if row < end {
+			if tb, ok := m.blocks[i].(toolBlock); ok {
+				tb.expanded = !tb.expanded
+				m.blocks[i] = tb
+				m.dirty = true
+			}
+			return
+		}
 	}
-	// header + prompt title + input box (border adds 2) + status + hint
-	used := 1 + 1 + inputH + 2 + 1 + 1
-	m.vp.Width = m.width
-	m.vp.Height = max(m.height-used, 1)
-	m.ta.SetWidth(max(m.width-4, 1))
-	m.ta.SetHeight(inputH)
-	m.syncViewport()
 }
 
-func (m *model) syncViewport() {
-	wrap := lipgloss.NewStyle().Width(max(m.vp.Width, 1))
-	rendered := make([]string, len(m.lines))
-	for i, line := range m.lines {
-		rendered[i] = wrap.Render(line)
+func (m *model) appendBlock(b block) {
+	if m.vp.AtBottom() || m.vp.Height == 0 {
+		m.stick = true
 	}
-	m.vp.SetContent(strings.Join(rendered, "\n"))
-	m.vp.GotoBottom()
+	m.blocks = append(m.blocks, b)
+	m.dirty = true
+}
+
+func (m *model) layout() {
+	if m.w == 0 {
+		return
+	}
+	m.inputH = 1
+	if m.expanded {
+		m.inputH = 8
+	}
+	m.vp.Width = m.w
+	m.vp.Height = max(m.h-m.usedRows(), 1)
+	m.ta.SetWidth(max(m.w-2, 1))
+	m.ta.SetHeight(m.inputH)
+	m.dirty = true
+}
+
+// usedRows counts every transcript-external row the view needs.
+func (m *model) usedRows() int {
+	used := 2 // header + status line
+	if m.dlg != nil {
+		used += lipgloss.Height(m.dlg.render(m.w, m.st))
+	} else {
+		if m.pending != nil {
+			used++
+		}
+		used += m.inputH + 2 // composer border
+	}
+	return used
+}
+
+func (m *model) renderTranscript() {
+	w := max(m.vp.Width, 1)
+	rows := make([]int, len(m.blocks))
+	var parts []string
+	total := 0
+	for i, b := range m.blocks {
+		r := b.render(w, m.st)
+		total += strings.Count(r, "\n") + 1
+		rows[i] = total
+		parts = append(parts, r, "") // blank line between blocks
+	}
+	m.rows = rows
+	content := strings.Join(parts, "\n")
+	m.vp.SetContent(strings.TrimSuffix(content, "\n"))
+	if m.stick {
+		m.vp.GotoBottom()
+	}
+	m.dirty = false
+}
+
+func (m *model) busy() bool {
+	return !m.done && m.pending == nil && m.dlg == nil && m.status != ""
+}
+
+func (m *model) statusLine() string {
+	if m.busy() {
+		return m.sp.View() + " " + m.st.info.Render(m.status)
+	}
+	if m.status == "" {
+		return m.st.faint.Render("ready")
+	}
+	if m.done && m.doneOk {
+		return m.st.ok.Render("● " + m.status)
+	}
+	if m.statusErr {
+		return m.st.errStyle.Render("● " + m.status)
+	}
+	return m.st.dim.Render(m.status)
+}
+
+func (m *model) header() string {
+	left := m.st.title.Render("stubbs") + " " + m.st.modeBadge(m.mode.String())
+	right := m.st.faint.Render(m.opts.Model) +
+		m.st.dim.Render(fmt.Sprintf(" · step %d · $%.4f", m.steps, m.cost))
+	if pad := m.w - plainWidth(left) - plainWidth(right); pad >= 1 {
+		return left + strings.Repeat(" ", pad) + right
+	}
+	return wrapAt(m.w).Render(left)
 }
 
 func (m *model) View() string {
-	if m.width == 0 {
+	if m.w == 0 {
 		return "loading…"
 	}
-	header := titleStyle.Render(" stubbs ") +
-		dimStyle.Render(fmt.Sprintf("· mode %s · step %d · $%.4f · %s", m.mode, m.steps, m.cost, m.opts.Model))
-	title := ""
-	if m.pending != nil {
-		title = infoStyle.Render(m.pending.title)
+	if m.dirty {
+		m.renderTranscript()
 	}
-	status := m.status
-	if strings.TrimSpace(status) == "" {
-		status = "ready"
+	var bottom []string
+	if m.dlg != nil {
+		sheet := lipgloss.PlaceHorizontal(m.w, lipgloss.Center, m.dlg.render(m.w, m.st))
+		bottom = append(bottom, sheet)
+	} else {
+		if m.pending != nil {
+			bottom = append(bottom, m.st.agent.Render("❯ ")+m.st.info.Render(m.pending.title))
+		}
+		box := m.st.box
+		if m.pending != nil || (!m.done && m.status == "") {
+			box = m.st.boxFocus
+		}
+		bottom = append(bottom, box.Render(m.ta.View()))
 	}
-	return lipgloss.JoinVertical(lipgloss.Left,
-		header,
-		m.vp.View(),
-		title,
-		dimStyle.Render(status),
-		boxStyle.Render(m.ta.View()),
-		dimStyle.Render("enter submit · ctrl+j newline · ctrl+e expand · /h help · ctrl-c interrupt"),
-	)
-}
-
-func clip(s string, maxLines int) string {
-	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
-	if len(lines) <= maxLines {
-		return s
-	}
-	head := maxLines * 2 / 3
-	tail := maxLines - head
-	hidden := len(lines) - head - tail
-	out := append([]string{}, lines[:head]...)
-	out = append(out, dimStyle.Render(fmt.Sprintf("… [%d lines hidden] …", hidden)))
-	out = append(out, lines[len(lines)-tail:]...)
-	return strings.Join(out, "\n")
+	return lipgloss.JoinVertical(lipgloss.Left, m.header(), m.vp.View(), m.statusLine(), strings.Join(bottom, "\n"))
 }
 
 func fieldInt(fields []string, i int) (int, error) {

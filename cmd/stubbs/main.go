@@ -107,7 +107,7 @@ func run() error {
 		AutoQuit:         *autoQuitF,
 	}
 
-	app := tui.New(tui.Options{Model: model, AutoQuit: *autoQuitF})
+	app := tui.New(tui.Options{Model: model, AutoQuit: *autoQuitF, Theme: cfg.Theme, Mode: mode})
 	ia, err := agent.NewInteractiveAgent(iCfg, client, environ, model, app)
 	if err != nil {
 		return err

@@ -10,6 +10,10 @@ import (
 
 const DefaultModel = "z-ai/glm-5.3-flash"
 
+// DefaultTheme is used when no theme is configured. "tokyo" is a
+// Tokyonight-inspired dark palette; "system" inherits the terminal's ANSI palette.
+const DefaultTheme = "tokyo"
+
 var (
 	KnownProviders = []string{"openrouter"}
 	KnownEnvs      = []string{"local", "docker"}
@@ -20,6 +24,7 @@ type StubbsConfig struct {
 	Model    string
 	Env      string
 	APIKey   string
+	Theme    string
 }
 
 func Load() StubbsConfig {
@@ -29,6 +34,7 @@ func Load() StubbsConfig {
 		Provider: "openrouter",
 		Model:    DefaultModel,
 		Env:      "local",
+		Theme:    DefaultTheme,
 	}
 
 	if v := file["PROVIDER"]; v != "" {
@@ -49,6 +55,9 @@ func Load() StubbsConfig {
 	if v := file["STUBBS_API_KEY"]; v != "" {
 		cfg.APIKey = v
 	}
+	if v := file["STUBBS_THEME"]; v != "" {
+		cfg.Theme = v
+	}
 
 	if v := os.Getenv("STUBBS_PROVIDER"); v != "" {
 		cfg.Provider = v
@@ -61,6 +70,9 @@ func Load() StubbsConfig {
 	}
 	if v := os.Getenv("STUBBS_API_KEY"); v != "" {
 		cfg.APIKey = v
+	}
+	if v := os.Getenv("STUBBS_THEME"); v != "" {
+		cfg.Theme = v
 	}
 	if v := os.Getenv("OPENROUTER_API_KEY"); v != "" {
 		cfg.APIKey = v
