@@ -85,6 +85,7 @@ type InteractiveConfig struct {
 	Mode             Mode
 	WhitelistActions []string // regexes; matching commands skip confirmation
 	ConfirmExit      bool
+	AutoQuit         bool
 }
 
 type InteractiveAgent struct {
@@ -303,6 +304,9 @@ func (ia *InteractiveAgent) checkBudget() error {
 		return nil
 	}
 	for ia.exceeded() {
+		if ia.cfg.AutoQuit {
+			return ErrLimitsExceeded
+		}
 		ia.ui.Info("Limits exceeded. Limits: %d steps, $%.2f. Current spend: %d steps, $%.4f.",
 			ia.cfg.StepLimit, ia.cfg.CostLimit, ia.Steps, ia.Cost)
 		steps, cost, ok, err := ia.ui.AskNewLimits(ia.Steps, ia.cfg.StepLimit, ia.Cost, ia.cfg.CostLimit)
