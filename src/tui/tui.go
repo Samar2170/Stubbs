@@ -360,6 +360,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.statusErr = !msg.ok
 		m.ta.Reset()
 		m.ta.Blur()
+		m.layout()
 		if msg.ok {
 			m.appendBlock(okBlock{text: msg.summary})
 		} else {
@@ -395,11 +396,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	var cmds []tea.Cmd
-	var cmd tea.Cmd
 	if m.dlg == nil {
-		m.ta, cmd = m.ta.Update(msg)
-		cmds = append(cmds, cmd)
+		cmds = append(cmds, m.updateTA(msg))
 	}
+	var cmd tea.Cmd
 	m.vp, cmd = m.vp.Update(msg)
 	cmds = append(cmds, cmd)
 	if !m.vp.AtBottom() {
@@ -455,9 +455,19 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	return m, m.updateTA(msg)
+}
+
+// updateTA forwards msg to the composer and re-lays out the view when the
+// content grows or shrinks, so the box keeps the cursor visible.
+func (m *model) updateTA(msg tea.Msg) tea.Cmd {
+	before := m.desiredInputH()
 	var cmd tea.Cmd
-	m.ta, cmd = m.ta.Update(msg) // ctrl+j inserts a newline
-	return m, cmd
+	m.ta, cmd = m.ta.Update(msg)
+	if m.desiredInputH() != before {
+		m.layout()
+	}
+	return cmd
 }
 
 func (m *model) handleDialogKey(key string) (tea.Model, tea.Cmd) {
@@ -793,15 +803,28 @@ func (m *model) layout() {
 	if m.w == 0 {
 		return
 	}
-	m.inputH = 1
-	if m.expanded {
-		m.inputH = 8
-	}
+	m.inputH = m.desiredInputH()
 	m.vp.Width = m.w
 	m.vp.Height = max(m.h-m.usedRows(), 1)
 	m.ta.SetWidth(max(m.w-2, 1))
 	m.ta.SetHeight(m.inputH)
 	m.dirty = true
+}
+
+// desiredInputH is the composer height needed to show all of its content:
+// one row per logical line plus extra rows for long lines that wrap. The
+// expanded flag (ctrl+e, /m) acts as a minimum height, and the result is
+// capped so the transcript viewport always keeps at least one row.
+func (m *model) desiredInputH() int {
+	w := max(m.w-2, 1) // same width layout() gives the textarea
+	rows := 0
+	for _, l := range strings.Split(m.ta.Value(), "\n") {
+		rows += max(1, (plainWidth(l)+w-1)/w)
+	}
+	if m.expanded {
+		rows = max(rows, 8)
+	}
+	return min(rows, max(m.h-4, 1))
 }
 
 // usedRows counts every transcript-external row the view needs.

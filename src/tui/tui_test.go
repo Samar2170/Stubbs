@@ -300,6 +300,63 @@ func TestSelectedTextTrimsAndJoins(t *testing.T) {
 	}
 }
 
+func TestComposerAutoGrow(t *testing.T) {
+	m := testModel()
+	m.w, m.h = 80, 24
+	m.layout()
+
+	if m.inputH != 1 {
+		t.Fatalf("empty composer height = %d, want 1", m.inputH)
+	}
+
+	m.ta.SetValue("one\ntwo\nthree")
+	m.layout()
+	if m.inputH != 3 {
+		t.Errorf("multiline composer height = %d, want 3", m.inputH)
+	}
+
+	// A long line wraps and needs an extra row (composer width = 80-2).
+	m.ta.SetValue(strings.Repeat("a", 100))
+	m.layout()
+	if m.inputH != 2 {
+		t.Errorf("wrapped composer height = %d, want 2", m.inputH)
+	}
+
+	// The expanded flag (ctrl+e, /m) forces a minimum of 8 rows.
+	m.expanded = true
+	m.ta.SetValue("")
+	m.layout()
+	if m.inputH != 8 {
+		t.Errorf("expanded composer height = %d, want 8", m.inputH)
+	}
+	m.expanded = false
+
+	// Tiny terminals cap the composer so the viewport keeps a row.
+	m.h = 8
+	m.ta.SetValue(strings.Repeat("x\n", 50))
+	m.layout()
+	if m.inputH != 4 {
+		t.Errorf("capped composer height = %d, want 4", m.inputH)
+	}
+}
+
+func TestUpdateTAGrowsAndShrinksBox(t *testing.T) {
+	m := testModel()
+	m.w, m.h = 80, 24
+	m.layout()
+
+	m.updateTA(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a\nb")})
+	if m.inputH != 2 {
+		t.Errorf("height after newline = %d, want 2", m.inputH)
+	}
+
+	m.ta.Reset()
+	m.layout()
+	if m.inputH != 1 {
+		t.Errorf("height after reset = %d, want 1", m.inputH)
+	}
+}
+
 func TestMouseClickTogglesToolBlock(t *testing.T) {
 	m := testModel()
 	m.vp.Width, m.vp.Height = 80, 20
