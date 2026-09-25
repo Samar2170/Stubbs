@@ -4,3 +4,14 @@ stubbs
 
 
 .vscode/
+
+# benchmark artifacts
+bench/.venv/
+bench/results/
+bench/logs/
+bench/instances.jsonl
+bench/polyglot/polyglot-benchmark/
+bench/polyglot/results/
+bench/polyglot/logs/
+bench/polyglot/exercises.jsonl
+__pycache__
