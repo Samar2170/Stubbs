@@ -19,6 +19,7 @@ import (
 	"sync"
 	"syscall"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/pflag"
 )
 
@@ -129,6 +130,10 @@ func run() error {
 		if runTask == "" {
 			t, err := app.AwaitTask()
 			if err != nil {
+				if errors.Is(err, agent.ErrInterrupted) {
+					app.Quit()
+					return
+				}
 				app.Finish("", err)
 				return
 			}
@@ -152,7 +157,9 @@ func run() error {
 	stop()
 	wg.Wait()
 	printSummary(ia, runErr)
-	if tuiErr != nil {
+	// A user interrupt (ctrl-c delivered as SIGINT) or a killed program is a
+	// normal way to leave the TUI, not an error.
+	if tuiErr != nil && !errors.Is(tuiErr, tea.ErrInterrupted) && !errors.Is(tuiErr, tea.ErrProgramKilled) {
 		return tuiErr
 	}
 	switch {
@@ -249,6 +256,8 @@ func summarizeRun(err error) string {
 		return "complete"
 	case errors.Is(err, agent.ErrAborted):
 		return "aborted"
+	case errors.Is(err, agent.ErrInterrupted):
+		return "interrupted"
 	case errors.Is(err, agent.ErrLimitsExceeded):
 		return "limits exceeded"
 	case errors.Is(err, context.Canceled):

@@ -32,7 +32,7 @@ type Agent struct {
 	Session     *Session
 }
 
-func NewAgent(cfg *AgentConfig, client llm.ModelClient, environ env.Environment, model string) (*Agent, error) {
+func NewAgent(cfg *AgentConfig, client llm.ModelClient, environ env.Environment, model string, contextEnabled bool) (*Agent, error) {
 	if cfg == nil {
 		cfg = &AgentConfig{}
 	}

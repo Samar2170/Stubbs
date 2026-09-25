@@ -11,6 +11,9 @@ var DEBUG = true
 
 var ProjectDir string
 var SessionsDir string
+var ContextDir string
+var MemoryDir string
+
 var ProjectConfigFile string
 
 func init() {
@@ -36,6 +39,16 @@ func init() {
 	SessionsDir = filepath.Join(ProjectDir, "sessions")
 	if err := os.MkdirAll(SessionsDir, os.ModePerm); err != nil {
 		panic(fmt.Errorf("create sessions dir: %w", err))
+	}
+
+	ContextDir = filepath.Join(ProjectDir, "context")
+	if err := os.MkdirAll(ContextDir, os.ModePerm); err != nil {
+		panic(fmt.Errorf("create context dir: %w", err))
+	}
+
+	MemoryDir = filepath.Join(ProjectDir, "memory")
+	if err := os.MkdirAll(MemoryDir, os.ModePerm); err != nil {
+		panic(fmt.Errorf("create memory dir: %w", err))
 	}
 
 	if err != nil {

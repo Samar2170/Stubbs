@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/atotto/clipboard"
 	"github.com/aymanbagabas/go-osc52/v2"
@@ -86,6 +87,8 @@ type App struct {
 	prog      *tea.Program
 	interrupt func()
 	autoQuit  bool
+	closed    chan struct{}
+	closeOnce sync.Once
 }
 
 func New(opts Options) *App {
@@ -99,7 +102,7 @@ func New(opts Options) *App {
 	m.ta = newTextarea()
 	m.sp = spinner.New(spinner.WithSpinner(spinner.MiniDot))
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
-	a := &App{prog: p, autoQuit: opts.AutoQuit}
+	a := &App{prog: p, autoQuit: opts.AutoQuit, closed: make(chan struct{})}
 	m.app = a
 	return a
 }
@@ -107,11 +110,16 @@ func New(opts Options) *App {
 // SetInterrupt wires Ctrl-C to the agent (call after the agent is built).
 func (a *App) SetInterrupt(f func()) { a.interrupt = f }
 
-// Run runs the TUI until the user quits.
+// Run runs the TUI until the user quits. When it returns, any prompt that is
+// still waiting for an answer is released so the agent goroutine can stop.
 func (a *App) Run() error {
 	_, err := a.prog.Run()
+	a.closeOnce.Do(func() { close(a.closed) })
 	return err
 }
+
+// Quit asks the TUI to stop; safe to call from any goroutine.
+func (a *App) Quit() { a.prog.Quit() }
 
 // AwaitTask blocks until the user submits the initial task.
 func (a *App) AwaitTask() (string, error) {
@@ -139,6 +147,8 @@ func finishSummary(err error) (string, bool) {
 		return "Run complete.", true
 	case errors.Is(err, agent.ErrAborted):
 		return "Run aborted by user.", false
+	case errors.Is(err, agent.ErrInterrupted):
+		return "Run interrupted.", false
 	case errors.Is(err, agent.ErrLimitsExceeded):
 		return "Run ended: limits exceeded.", false
 	case errors.Is(err, context.Canceled):
@@ -151,7 +161,12 @@ func finishSummary(err error) (string, bool) {
 func (a *App) ask(kind inputKind, title string) (string, error) {
 	reply := make(chan inputResult, 1)
 	a.prog.Send(inputReqMsg{kind: kind, title: title, reply: reply})
-	res := <-reply
+	var res inputResult
+	select {
+	case res = <-reply:
+	case <-a.closed:
+		return "", agent.ErrInterrupted
+	}
 	switch {
 	case res.aborted:
 		return "", agent.ErrAborted
@@ -205,7 +220,12 @@ func (a *App) AskExit() (string, error) {
 }
 
 func (a *App) await(reply chan inputResult) (string, error) {
-	res := <-reply
+	var res inputResult
+	select {
+	case res = <-reply:
+	case <-a.closed:
+		return "", agent.ErrInterrupted
+	}
 	switch {
 	case res.aborted:
 		return "", agent.ErrAborted
@@ -228,7 +248,12 @@ func (a *App) AskNewLimits(curSteps, stepLimit int, curCost, costLimit float32) 
 		curCost: curCost, costLimit: costLimit,
 		reply: reply,
 	})
-	res := <-reply
+	var res inputResult
+	select {
+	case res = <-reply:
+	case <-a.closed:
+		return 0, 0, false, agent.ErrAborted
+	}
 	if res.aborted || res.interrupted {
 		return 0, 0, false, agent.ErrAborted
 	}
@@ -276,6 +301,7 @@ type model struct {
 	sp        spinner.Model
 	status    string
 	statusErr bool
+	working   bool
 	doneOk    bool
 	mode      agent.Mode
 	steps     int
@@ -292,6 +318,10 @@ func newTextarea() textarea.Model {
 	ta.Prompt = ""
 	ta.ShowLineNumbers = false
 	ta.CharLimit = 0
+	// bubbles paints the cursor line with a black background by default, which
+	// shows through as a dark band over the text being typed. Drop it.
+	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
+	ta.BlurredStyle.CursorLine = lipgloss.NewStyle()
 	ta.SetWidth(80)
 	ta.SetHeight(1)
 	ta.Focus()
@@ -316,6 +346,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case statusMsg:
 		m.status = string(msg)
 		m.statusErr = false
+		m.working = true
 		return m, nil
 
 	case headerMsg:
@@ -327,6 +358,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case inputReqMsg:
+		m.working = false
 		if msg.kind == inConfirm || msg.kind == inExit {
 			d := &dialog{reply: msg.reply}
 			if msg.kind == inConfirm {
@@ -345,6 +377,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, textarea.Blink
 
 	case limitsReqMsg:
+		m.working = false
 		m.pending = &pendingInput{kind: inLimits, title: "Raise limits", reply: msg.reply}
 		m.ta.Placeholder = fmt.Sprintf("new limits, e.g. '%d %.2f'  ·  q ends the run", msg.stepLimit, msg.costLimit)
 		m.ta.Reset()
@@ -353,9 +386,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case doneMsg:
 		m.done = true
+		m.working = false
 		m.pending = nil
 		m.dlg = nil
-		m.status = msg.summary
+		m.status = msg.summary + " — ctrl+c or esc to quit"
 		m.doneOk = msg.ok
 		m.statusErr = !msg.ok
 		m.ta.Reset()
@@ -377,6 +411,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 
 	case copiedMsg:
+		m.working = false
 		m.status = fmt.Sprintf("copied %d line%s to clipboard", int(msg), pluralLines(int(msg)))
 		return m, nil
 
@@ -424,7 +459,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "esc":
 		if m.done {
-			return m, nil
+			return m, tea.Quit
 		}
 		return m.interruptKey()
 
@@ -581,6 +616,7 @@ func (m *model) interruptKey() (tea.Model, tea.Cmd) {
 	if m.app != nil && m.app.interrupt != nil {
 		m.app.interrupt()
 		m.status = "interrupting — tell the agent what happened…"
+		m.working = true
 	}
 	return m, nil
 }
@@ -653,8 +689,10 @@ func (m *model) resolveReply(reply chan inputResult, res inputResult) {
 func (m *model) resetPrompt() {
 	m.status = ""
 	m.statusErr = false
+	m.working = false
 	m.ta.Reset()
 	m.ta.Placeholder = idlePlaceholder
+	m.ta.Focus()
 	m.dlg = nil
 	m.layout()
 }
@@ -758,7 +796,9 @@ func (m *model) clearSelection() {
 // with capable terminals), then the native clipboard.
 func copyCmd(text string, lines int) tea.Cmd {
 	return func() tea.Msg {
-		if len(text) <= 100_000 {
+		// OSC52 only helps when the native clipboard is out of reach (SSH).
+		// Emitting it locally races the renderer on os.Stdout, so skip it there.
+		if len(text) <= 100_000 && (os.Getenv("SSH_TTY") != "" || os.Getenv("SSH_CONNECTION") != "") {
 			fmt.Fprint(os.Stdout, osc52.New(text).String())
 		}
 		_ = clipboard.WriteAll(text)
@@ -888,7 +928,7 @@ func (m *model) applySelection() {
 }
 
 func (m *model) busy() bool {
-	return !m.done && m.pending == nil && m.dlg == nil && m.status != ""
+	return m.working && !m.done && m.pending == nil && m.dlg == nil
 }
 
 func (m *model) statusLine() string {

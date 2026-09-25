@@ -1,13 +1,16 @@
 package tui
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
+	"stubbs/src/agent"
 	"stubbs/src/types"
 )
 
@@ -15,6 +18,24 @@ func testModel() *model {
 	m := &model{st: newStyles(loadTheme("tokyo"))}
 	m.ta = newTextarea()
 	return m
+}
+
+// TestAwaitReturnsWhenAppClosed guards against the freeze where main blocked
+// on wg.Wait() forever because a pending Ask* never resolved after the TUI
+// program stopped (e.g. ctrl-c delivered as SIGINT).
+func TestAwaitReturnsWhenAppClosed(t *testing.T) {
+	a := &App{closed: make(chan struct{})}
+	close(a.closed)
+	if _, err := a.await(make(chan inputResult, 1)); !errors.Is(err, agent.ErrInterrupted) {
+		t.Fatalf("await after program stop = %v, want ErrInterrupted", err)
+	}
+}
+
+func TestFinishSummaryInterrupted(t *testing.T) {
+	got, ok := finishSummary(agent.ErrInterrupted)
+	if ok || got != "Run interrupted." {
+		t.Fatalf("finishSummary(ErrInterrupted) = %q, %v; want %q, false", got, ok, "Run interrupted.")
+	}
 }
 
 func TestLoadTheme(t *testing.T) {
@@ -383,6 +404,49 @@ func TestMouseClickTogglesToolBlock(t *testing.T) {
 	tb, ok := m.blocks[1].(toolBlock)
 	if !ok || tb.expanded {
 		t.Errorf("click should have collapsed the tool block, got %+v", tb)
+	}
+}
+
+func TestEscapeQuitsWhenDone(t *testing.T) {
+	m := testModel()
+	m.done = true
+	_, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if cmd == nil {
+		t.Fatal("esc while the run is done should quit the program")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Errorf("esc while done produced %T, want tea.QuitMsg", cmd())
+	}
+}
+
+func TestComposerHasNoCursorLineBackground(t *testing.T) {
+	ta := newTextarea()
+	if _, ok := ta.FocusedStyle.CursorLine.GetBackground().(lipgloss.NoColor); !ok {
+		t.Error("composer focused cursor line must not paint a background")
+	}
+	if _, ok := ta.BlurredStyle.CursorLine.GetBackground().(lipgloss.NoColor); !ok {
+		t.Error("composer blurred cursor line must not paint a background")
+	}
+}
+
+func TestResetPromptRefocusesComposer(t *testing.T) {
+	m := testModel()
+	m.ta.Blur()
+	m.resetPrompt()
+	if !m.ta.Focused() {
+		t.Error("resetPrompt should refocus the composer")
+	}
+}
+
+func TestBusyTracksWorkingNotStatus(t *testing.T) {
+	m := testModel()
+	m.Update(statusMsg("waiting for LLM..."))
+	if !m.busy() {
+		t.Error("an agent status should count as busy")
+	}
+	m.Update(copiedMsg(2))
+	if m.busy() {
+		t.Error("a clipboard status must not count as busy")
 	}
 }
 
