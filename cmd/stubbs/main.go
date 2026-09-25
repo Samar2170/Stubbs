@@ -137,6 +137,9 @@ func run() error {
 				return
 			}
 			runTask = t
+		} else {
+			// CLI-provided task: the TUI didn't echo it, show it now.
+			app.ShowUser(runTask)
 		}
 		out, runErr = ia.Run(ctx, runTask)
 		app.Finish(out, runErr)

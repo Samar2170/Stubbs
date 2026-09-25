@@ -4,14 +4,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 
+	"github.com/atotto/clipboard"
+	"github.com/aymanbagabas/go-osc52/v2"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"stubbs/src/agent"
 	"stubbs/src/types"
@@ -44,6 +48,7 @@ type pendingInput struct {
 
 type blockMsg struct{ b block }
 type statusMsg string
+type copiedMsg int
 type headerMsg struct {
 	steps int
 	cost  float32
@@ -113,13 +118,16 @@ func (a *App) AwaitTask() (string, error) {
 	return a.ask(inTask, "What do you want to do?")
 }
 
+// ShowUser displays a user message in the transcript (e.g. a task passed on
+// the command line). Messages typed in the TUI are echoed automatically.
+func (a *App) ShowUser(text string) {
+	a.prog.Send(blockMsg{userBlock{text: text}})
+}
+
 // Finish reports the run outcome and lets the user quit with ctrl-c.
 func (a *App) Finish(submission string, err error) {
 	summary, ok := finishSummary(err)
 	a.prog.Send(doneMsg{summary: summary, ok: ok})
-	if s := strings.TrimSpace(submission); s != "" {
-		a.prog.Send(blockMsg{userBlock{text: s}})
-	}
 	if a.autoQuit {
 		a.prog.Send(autoQuitMsg{})
 	}
@@ -241,6 +249,13 @@ func (a *App) AskNewLimits(curSteps, stepLimit int, curCost, costLimit float32) 
 
 // --- bubbletea model ---
 
+// tLine is one rendered transcript line: the styled version for display and
+// its plain text for selection/copy.
+type tLine struct {
+	plain string
+	ansi  string
+}
+
 type model struct {
 	opts      Options
 	app       *App
@@ -249,8 +264,12 @@ type model struct {
 	inputH    int
 	blocks    []block
 	rows      []int // cumulative transcript line count per block
-	stick     bool  // follow the bottom of the transcript
-	showTools bool  // global expand/collapse for tool output (start expanded)
+	tLines    []tLine
+	selAnchor int // selection anchor line (-1 = no selection)
+	selHead   int // selection head line
+	selecting bool
+	stick     bool // follow the bottom of the transcript
+	showTools bool // global expand/collapse for tool output (start expanded)
 	dirty     bool
 	vp        viewport.Model
 	ta        textarea.Model
@@ -356,11 +375,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.sp, cmd = m.sp.Update(msg)
 		return m, cmd
 
+	case copiedMsg:
+		m.status = fmt.Sprintf("copied %d line%s to clipboard", int(msg), pluralLines(int(msg)))
+		return m, nil
+
 	case tea.MouseMsg:
 		var cmd tea.Cmd
 		m.vp, cmd = m.vp.Update(msg)
-		if msg.Type == tea.MouseLeft && msg.Action == tea.MouseActionPress {
-			m.toggleBlockAt(msg.Y - 1) // -1: header row
+		if cp := m.handleMouse(msg); cp != nil {
+			cmd = tea.Batch(cmd, cp)
+		}
+		if !m.vp.AtBottom() {
+			m.stick = false // the user scrolled up; stop auto-follow
 		}
 		return m, cmd
 
@@ -383,6 +409,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.selAnchor >= 0 {
+		m.clearSelection()
+	}
 	if m.dlg != nil {
 		return m.handleDialogKey(msg.String())
 	}
@@ -580,6 +609,15 @@ func (m *model) submitPending() {
 		m.layout()
 		return
 	}
+	// Echo conversation messages into the transcript so the user can see
+	// (and select) their own input. Commands in human mode are rendered by
+	// the agent; limits are not conversation.
+	switch m.pending.kind {
+	case inTask, inComment, inReject:
+		if t := strings.TrimSpace(text); t != "" {
+			m.appendBlock(userBlock{text: t})
+		}
+	}
 	m.resolve(inputResult{text: text})
 }
 
@@ -623,11 +661,114 @@ func (m *model) placeholderFor(kind inputKind) string {
 	return ""
 }
 
-func (m *model) toggleBlockAt(y int) {
-	if y < 0 {
+// handleMouse implements select-and-copy over the transcript. A press sets
+// the anchor, a drag moves the head, and a release copies the selected
+// lines. A click without a drag keeps its old meaning: toggle a tool block.
+func (m *model) handleMouse(msg tea.MouseMsg) tea.Cmd {
+	if m.dlg != nil {
+		return nil
+	}
+	row := msg.Y - 1 // -1: header row
+	if row < 0 || row >= m.vp.Height {
+		return nil
+	}
+	line := m.vp.YOffset + row
+	switch {
+	case msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft:
+		m.selecting = true
+		m.selAnchor, m.selHead = line, line
+		m.applySelection()
+
+	case msg.Action == tea.MouseActionMotion && msg.Button == tea.MouseButtonLeft && m.selecting:
+		if line >= 0 && line < len(m.tLines) && line != m.selHead {
+			m.selHead = line
+			m.applySelection()
+		}
+
+	case msg.Action == tea.MouseActionRelease && msg.Button == tea.MouseButtonLeft && m.selecting:
+		m.selecting = false
+		if m.selAnchor < 0 || m.selAnchor >= len(m.tLines) {
+			return nil
+		}
+		if m.selAnchor == m.selHead {
+			line := m.selAnchor // plain click: keep the old toggle behavior
+			m.clearSelection()
+			m.toggleBlockAt(line)
+			return nil
+		}
+		lo, hi := m.selRange()
+		text := m.selectedText(lo, hi)
+		if strings.TrimSpace(text) == "" {
+			return nil
+		}
+		return copyCmd(text, hi-lo+1)
+	}
+	return nil
+}
+
+// selRange returns the ordered selection bounds; empty range when inactive.
+func (m *model) selRange() (lo, hi int) {
+	if m.selAnchor < 0 {
+		return 1, 0
+	}
+	lo, hi = m.selAnchor, m.selHead
+	if lo > hi {
+		lo, hi = hi, lo
+	}
+	if hi >= len(m.tLines) {
+		hi = len(m.tLines) - 1
+	}
+	if lo < 0 {
+		lo = 0
+	}
+	return lo, hi
+}
+
+// selectedText joins the plain text of the selected lines.
+func (m *model) selectedText(lo, hi int) string {
+	lines := make([]string, 0, hi-lo+1)
+	for i := lo; i <= hi; i++ {
+		lines = append(lines, strings.TrimRight(m.tLines[i].plain, " "))
+	}
+	for len(lines) > 0 && lines[0] == "" {
+		lines = lines[1:]
+	}
+	for len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m *model) clearSelection() {
+	m.selAnchor, m.selHead = -1, -1
+	m.applySelection()
+}
+
+// copyCmd pushes text to the system clipboard: OSC52 first (works over SSH
+// with capable terminals), then the native clipboard.
+func copyCmd(text string, lines int) tea.Cmd {
+	return func() tea.Msg {
+		if len(text) <= 100_000 {
+			fmt.Fprint(os.Stdout, osc52.New(text).String())
+		}
+		_ = clipboard.WriteAll(text)
+		return copiedMsg(lines)
+	}
+}
+
+func pluralLines(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
+// toggleBlockAt expands/collapses the tool block owning the given
+// transcript line index.
+func (m *model) toggleBlockAt(row int) {
+	if row < 0 {
 		return
 	}
-	row := m.vp.YOffset + y
 	for i, end := range m.rows {
 		if row < end {
 			if tb, ok := m.blocks[i].(toolBlock); ok {
@@ -680,21 +821,47 @@ func (m *model) usedRows() int {
 func (m *model) renderTranscript() {
 	w := max(m.vp.Width, 1)
 	rows := make([]int, len(m.blocks))
-	var parts []string
+	lines := make([]tLine, 0, 64)
 	total := 0
 	for i, b := range m.blocks {
 		r := b.render(w, m.st)
+		for _, ln := range strings.Split(r, "\n") {
+			lines = append(lines, tLine{plain: ansi.Strip(ln), ansi: ln})
+		}
 		total += strings.Count(r, "\n") + 1
 		rows[i] = total
-		parts = append(parts, r, "") // blank line between blocks
+		lines = append(lines, tLine{}) // blank line between blocks
+		total++
 	}
 	m.rows = rows
-	content := strings.Join(parts, "\n")
-	m.vp.SetContent(strings.TrimSuffix(content, "\n"))
+	m.tLines = lines
+	m.dirty = false
+	m.applySelection()
 	if m.stick {
 		m.vp.GotoBottom()
 	}
-	m.dirty = false
+}
+
+// applySelection rebuilds the viewport content from the cached transcript
+// lines, highlighting the selected range. Cheap: no block re-rendering.
+func (m *model) applySelection() {
+	if len(m.tLines) == 0 {
+		return
+	}
+	lo, hi := m.selRange()
+	parts := make([]string, len(m.tLines))
+	for i, l := range m.tLines {
+		if i >= lo && i <= hi {
+			txt := l.plain
+			if strings.TrimSpace(txt) == "" {
+				txt = " "
+			}
+			parts[i] = m.st.selLine.Render(txt)
+		} else {
+			parts[i] = l.ansi
+		}
+	}
+	m.vp.SetContent(strings.Join(parts, "\n"))
 }
 
 func (m *model) busy() bool {

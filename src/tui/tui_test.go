@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/textarea"
+	tea "github.com/charmbracelet/bubbletea"
 
 	"stubbs/src/types"
 )
@@ -214,5 +215,154 @@ func TestTextareaStillWorksAfterResolve(t *testing.T) {
 	}
 	if m.pending != nil || m.status != "" {
 		t.Error("resolve should clear pending state")
+	}
+}
+
+func TestSubmitEchoesUserMessage(t *testing.T) {
+	for _, kind := range []inputKind{inTask, inComment, inReject} {
+		m := testModel()
+		reply := make(chan inputResult, 1)
+		m.pending = &pendingInput{kind: kind, reply: reply}
+		m.ta.SetValue("my input")
+		m.submitPending()
+		<-reply
+		var found bool
+		for _, b := range m.blocks {
+			if ub, ok := b.(userBlock); ok && ub.text == "my input" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("kind %d: user message not echoed to transcript", kind)
+		}
+	}
+}
+
+func TestSubmitDoesNotEchoLimitsOrCommands(t *testing.T) {
+	for kind, val := range map[inputKind]string{inLimits: "24 5", inCommand: "some text"} {
+		m := testModel()
+		reply := make(chan inputResult, 1)
+		m.pending = &pendingInput{kind: kind, reply: reply}
+		m.ta.SetValue(val)
+		m.submitPending()
+		<-reply
+		if len(m.blocks) != 0 {
+			t.Errorf("kind %d: should not echo to transcript", kind)
+		}
+	}
+}
+
+func fakeLines(n int) []tLine {
+	lines := make([]tLine, n)
+	for i := range lines {
+		lines[i] = tLine{plain: "text " + strings.Repeat("x", i), ansi: "text"}
+	}
+	return lines
+}
+
+func TestSelRange(t *testing.T) {
+	m := testModel()
+	m.tLines = fakeLines(10)
+	m.selAnchor, m.selHead = -1, -1
+
+	if lo, hi := m.selRange(); lo <= hi {
+		t.Error("no selection should give empty range")
+	}
+
+	m.selAnchor, m.selHead = 3, 7
+	if lo, hi := m.selRange(); lo != 3 || hi != 7 {
+		t.Errorf("forward range = %d..%d, want 3..7", lo, hi)
+	}
+
+	m.selAnchor, m.selHead = 7, 3
+	if lo, hi := m.selRange(); lo != 3 || hi != 7 {
+		t.Errorf("reverse range = %d..%d, want 3..7", lo, hi)
+	}
+
+	m.selAnchor, m.selHead = 8, 99
+	if _, hi := m.selRange(); hi != 9 {
+		t.Errorf("clamped hi = %d, want 9", hi)
+	}
+}
+
+func TestSelectedTextTrimsAndJoins(t *testing.T) {
+	m := testModel()
+	m.tLines = []tLine{
+		{plain: ""},
+		{plain: "first line        ", ansi: "x"},
+		{plain: "second line", ansi: "x"},
+		{plain: ""},
+		{plain: "", ansi: "x"},
+	}
+	got := m.selectedText(0, 4)
+	if got != "first line\nsecond line" {
+		t.Errorf("selectedText = %q, want %q", got, "first line\nsecond line")
+	}
+}
+
+func TestMouseClickTogglesToolBlock(t *testing.T) {
+	m := testModel()
+	m.vp.Width, m.vp.Height = 80, 20
+	m.appendBlock(userBlock{text: "hi"})
+	m.appendBlock(toolBlock{name: "bash", expanded: true})
+	m.dirty = true
+	m.renderTranscript()
+
+	// Click on the tool block's first line (row 3: 1 user line + blank + tool line).
+	m.handleMouse(tea.MouseMsg{
+		X: 5, Y: 4, Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress, Type: tea.MouseMotion,
+	})
+	m.handleMouse(tea.MouseMsg{
+		X: 5, Y: 4, Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionRelease, Type: tea.MouseMotion,
+	})
+	if m.selecting {
+		t.Error("selection should end on release")
+	}
+	if len(m.blocks) != 2 {
+		t.Fatalf("unexpected block count %d", len(m.blocks))
+	}
+	tb, ok := m.blocks[1].(toolBlock)
+	if !ok || tb.expanded {
+		t.Errorf("click should have collapsed the tool block, got %+v", tb)
+	}
+}
+
+func TestMouseDragSelectionCopies(t *testing.T) {
+	m := testModel()
+	m.vp.Width, m.vp.Height = 80, 20
+	m.appendBlock(userBlock{text: "line one"})
+	m.appendBlock(infoBlock{text: "line two"})
+	m.dirty = true
+	m.renderTranscript()
+
+	m.handleMouse(tea.MouseMsg{
+		X: 0, Y: 2, Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress, Type: tea.MouseMotion,
+	})
+	m.handleMouse(tea.MouseMsg{
+		X: 0, Y: 3, Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionMotion, Type: tea.MouseMotion,
+	})
+	cmd := m.handleMouse(tea.MouseMsg{
+		X: 0, Y: 3, Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionRelease, Type: tea.MouseMotion,
+	})
+	if cmd == nil {
+		t.Fatal("drag-release should return a copy command")
+	}
+	for _, b := range m.blocks {
+		if tb, ok := b.(toolBlock); ok && !tb.expanded {
+			t.Error("drag must not toggle tool blocks")
+		}
+	}
+	if m.selAnchor < 0 {
+		t.Error("selection highlight should persist after copy")
+	}
+	// A keypress clears the highlight.
+	m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	if m.selAnchor >= 0 {
+		t.Error("keypress should clear selection")
 	}
 }

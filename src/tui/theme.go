@@ -78,6 +78,7 @@ type styles struct {
 	dialog   lipgloss.Style
 	option   lipgloss.Style // unselected dialog option
 	sel      lipgloss.Style // selected dialog option
+	selLine  lipgloss.Style // selected transcript line (mouse selection)
 }
 
 func newStyles(p palette) styles {
@@ -98,6 +99,7 @@ func newStyles(p palette) styles {
 		dialog:   lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(p.primary).Padding(0, 2),
 		option:   fg(p.muted),
 		sel:      fg(p.badgeFg).Background(p.accent).Bold(true),
+		selLine:  lipgloss.NewStyle().Background(p.muted).Foreground(p.badgeFg),
 	}
 }
 
