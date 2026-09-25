@@ -59,6 +59,7 @@ type limitsReqMsg struct {
 	reply               chan inputResult
 }
 type doneMsg string
+type autoQuitMsg struct{}
 
 var (
 	agentStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("203"))
@@ -73,7 +74,8 @@ var (
 const idlePlaceholder = "Type here…  (/h for help)"
 
 type Options struct {
-	Model string
+	Model    string
+	AutoQuit bool
 }
 
 // App implements agent.UI on top of a full-screen Bubble Tea program.
@@ -81,6 +83,7 @@ type Options struct {
 type App struct {
 	prog      *tea.Program
 	interrupt func()
+	autoQuit  bool
 }
 
 func New(opts Options) *App {
@@ -88,7 +91,7 @@ func New(opts Options) *App {
 	m.vp = viewport.New(80, 24)
 	m.ta = newTextarea()
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
-	a := &App{prog: p}
+	a := &App{prog: p, autoQuit: opts.AutoQuit}
 	m.app = a
 	return a
 }
@@ -124,6 +127,9 @@ func (a *App) Finish(submission string, err error) {
 	}
 	a.prog.Send(doneMsg(summary))
 	a.prog.Send(lineMsg(dimStyle.Render(strings.TrimSpace(submission))))
+	if a.autoQuit {
+		a.prog.Send(autoQuitMsg{})
+	}
 }
 
 func (a *App) ask(kind inputKind, title string) (string, error) {
@@ -292,6 +298,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ta.Reset()
 		m.ta.Blur()
 		return m, nil
+
+	case autoQuitMsg:
+		return m, tea.Quit
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)

@@ -1,0 +1,6 @@
+polyglot-benchmark/
+results/
+logs/
+__pycache__/
+exercises.jsonl
+.venv/

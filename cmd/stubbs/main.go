@@ -46,6 +46,7 @@ func run() error {
 	whitelistF := fs.StringSlice("whitelist", nil, "regex whitelist of commands that skip confirmation (confirm mode)")
 	outputF := fs.StringP("output", "o", "", "write the run to this JSON file")
 	exitNowF := fs.Bool("exit-immediately", false, "don't confirm when the agent wants to finish")
+	autoQuitF := fs.Bool("auto-quit", false, "quit automatically when the run ends (benchmark mode; implies --exit-immediately)")
 	configWizF := fs.Bool("config", false, "run the configuration wizard and exit")
 	versionF := fs.Bool("version", false, "print version and exit")
 	fs.Parse(os.Args[1:])
@@ -103,9 +104,10 @@ func run() error {
 		Mode:             mode,
 		WhitelistActions: *whitelistF,
 		ConfirmExit:      mode == agent.ModeConfirm && !*exitNowF,
+		AutoQuit:         *autoQuitF,
 	}
 
-	app := tui.New(tui.Options{Model: model})
+	app := tui.New(tui.Options{Model: model, AutoQuit: *autoQuitF})
 	ia, err := agent.NewInteractiveAgent(iCfg, client, environ, model, app)
 	if err != nil {
 		return err
@@ -146,6 +148,7 @@ func run() error {
 	tuiErr := app.Run()
 	stop()
 	wg.Wait()
+	printSummary(ia, runErr)
 	if tuiErr != nil {
 		return tuiErr
 	}
@@ -231,4 +234,23 @@ func orDefault(s, fallback string) string {
 		return s
 	}
 	return fallback
+}
+
+func printSummary(a *agent.InteractiveAgent, runErr error) {
+	fmt.Fprintf(os.Stderr, "stubbs: %s (steps=%d, cost=$%.4f)\n", summarizeRun(runErr), a.Steps, a.Cost)
+}
+
+func summarizeRun(err error) string {
+	switch {
+	case err == nil:
+		return "complete"
+	case errors.Is(err, agent.ErrAborted):
+		return "aborted"
+	case errors.Is(err, agent.ErrLimitsExceeded):
+		return "limits exceeded"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	default:
+		return "failed"
+	}
 }

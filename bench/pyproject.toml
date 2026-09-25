@@ -1,0 +1,15 @@
+[project]
+name = "stubbs-bench"
+version = "0.1.0"
+description = "Benchmark runner: stubbs agent on SWE-bench Verified instances"
+requires-python = ">=3.11,<3.13"
+# swebench 2.1.8 is the last version that builds eval specs from the classic
+# HF datasets (princeton-nlp/SWE-bench_Verified). 5.x requires precomputed
+# eval_script/image fields that the classic datasets do not carry.
+#
+# modal must stay era-matched: swebench 2.1.8 imports modal.Mount at module
+# load time (run_evaluation_modal), which modal >=1.0 removed.
+dependencies = ["swebench==2.1.8", "modal==0.73.7"]
+
+[tool.uv]
+package = false

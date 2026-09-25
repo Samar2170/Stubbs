@@ -69,10 +69,15 @@ func Load() StubbsConfig {
 	return cfg
 }
 
-// IsConfigured reports whether ProjectConfigFile contains any settings. An
-// empty (or missing) file means first-time setup should run.
+// IsConfigured reports whether stubbs has usable settings: either the project
+// config file contains settings, or the environment provides an API key
+// (STUBBS_API_KEY / OPENROUTER_API_KEY), which Load() honors. Benchmark and
+// container runs configure via env, so they must not trigger the wizard.
 func IsConfigured() bool {
-	return len(parseEnvFile(ProjectConfigFile)) > 0
+	if len(parseEnvFile(ProjectConfigFile)) > 0 {
+		return true
+	}
+	return os.Getenv("STUBBS_API_KEY") != "" || os.Getenv("OPENROUTER_API_KEY") != ""
 }
 
 // SaveConfig merges values into the env file at path, preserving other keys.
