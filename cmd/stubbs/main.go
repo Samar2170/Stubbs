@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"stubbs/src/agent"
 	"stubbs/src/config"
@@ -45,6 +46,8 @@ func run() error {
 	yoloF := fs.BoolP("yolo", "y", false, "run in yolo mode (execute without confirmation)")
 	humanF := fs.BoolP("human", "H", false, "start in human mode (you type the commands)")
 	whitelistF := fs.StringSlice("whitelist", nil, "regex whitelist of commands that skip confirmation (confirm mode)")
+	workdirF := fs.StringP("workdir", "C", "", "working directory the agent's tools are confined to (default: current directory)")
+	readSecretsF := fs.Bool("read-secrets", false, "allow the agent to read .env/secret files")
 	outputF := fs.StringP("output", "o", "", "write the run to this JSON file")
 	exitNowF := fs.Bool("exit-immediately", false, "don't confirm when the agent wants to finish")
 	autoQuitF := fs.Bool("auto-quit", false, "quit automatically when the run ends (benchmark mode; implies --exit-immediately)")
@@ -92,10 +95,30 @@ func run() error {
 	case *humanF:
 		mode = agent.ModeHuman
 	}
+	workdir := *workdirF
+	if workdir == "" {
+		if wd, err := os.Getwd(); err == nil {
+			workdir = wd
+		} else {
+			workdir = "."
+		}
+	}
+	if abs, err := filepath.Abs(workdir); err == nil {
+		workdir = abs
+	}
+
 	registry := types.NewRegistry()
-	registry.Register(tools.NewBashTool())
+	bashTool := tools.NewBashTool()
+	bashTool.Dir = workdir
+	registry.Register(bashTool)
+	readTool := tools.NewFileReadTool(workdir)
+	readTool.ReadSecrets = *readSecretsF
+	registry.Register(readTool)
+	registry.Register(tools.NewFileWriteTool(workdir))
+	registry.Register(tools.NewFileListTool(workdir))
+	registry.Register(tools.NewFileEditTool(workdir))
 	client := llm.NewORClient(cfg.APIKey, []string{model}, registry)
-	environ := env.NewLocalEnvironment(env.EnvironmentConfig{Timeout: 300}, registry)
+	environ := env.NewLocalEnvironment(env.EnvironmentConfig{WorkingDir: workdir, Timeout: 300}, registry)
 
 	iCfg := agent.InteractiveConfig{
 		AgentConfig: agent.AgentConfig{

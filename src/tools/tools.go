@@ -81,7 +81,7 @@ func (b *BashTool) Execute(ctx context.Context, args string) types.ExecutionOutp
 
 	runErr := cmd.Run()
 	out := types.ExecutionOutput{
-		Output: buf.String(),
+		Output: truncateOutput(buf.String(), defaultMaxOutputSize),
 		Code:   exitCode(runErr, runCtx),
 	}
 	if runErr != nil {
