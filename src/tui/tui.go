@@ -4,14 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
-	"time"
+	"sync"
 
+	"github.com/atotto/clipboard"
+	"github.com/aymanbagabas/go-osc52/v2"
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"stubbs/src/agent"
 	"stubbs/src/types"
@@ -26,12 +31,13 @@ const (
 	inExit
 	inTask
 	inLimits
+	inReject
 )
 
 type inputResult struct {
 	text        string
 	interrupted bool // ctrl-c while this prompt was pending
-	aborted     bool // ctrl-c at comment/limits prompt: abort the run
+	aborted     bool // ctrl-c at comment/limits/reject prompt: abort the run
 	cancelled   bool // "q" at the limits prompt: end the run
 }
 
@@ -41,41 +47,38 @@ type pendingInput struct {
 	reply chan inputResult
 }
 
-type lineMsg string
+type blockMsg struct{ b block }
 type statusMsg string
+type copiedMsg int
 type headerMsg struct {
 	steps int
 	cost  float32
 }
 type modeMsg agent.Mode
 type inputReqMsg struct {
-	kind  inputKind
-	title string
-	reply chan inputResult
+	kind     inputKind
+	title    string
+	commands []string
+	reply    chan inputResult
 }
 type limitsReqMsg struct {
 	curSteps, stepLimit int
 	curCost, costLimit  float32
 	reply               chan inputResult
 }
-type doneMsg string
+type doneMsg struct {
+	summary string
+	ok      bool
+}
 type autoQuitMsg struct{}
-
-var (
-	agentStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("203"))
-	userStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42"))
-	toolStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	infoStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-	dimStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
-	boxStyle   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("240"))
-)
 
 const idlePlaceholder = "Type here…  (/h for help)"
 
 type Options struct {
 	Model    string
 	AutoQuit bool
+	Theme    string
+	Mode     agent.Mode
 }
 
 // App implements agent.UI on top of a full-screen Bubble Tea program.
@@ -84,14 +87,22 @@ type App struct {
 	prog      *tea.Program
 	interrupt func()
 	autoQuit  bool
+	closed    chan struct{}
+	closeOnce sync.Once
 }
 
 func New(opts Options) *App {
-	m := &model{opts: opts}
+	m := &model{
+		opts:      opts,
+		st:        newStyles(loadTheme(opts.Theme)),
+		mode:      opts.Mode,
+		showTools: true,
+	}
 	m.vp = viewport.New(80, 24)
 	m.ta = newTextarea()
+	m.sp = spinner.New(spinner.WithSpinner(spinner.MiniDot))
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
-	a := &App{prog: p, autoQuit: opts.AutoQuit}
+	a := &App{prog: p, autoQuit: opts.AutoQuit, closed: make(chan struct{})}
 	m.app = a
 	return a
 }
@@ -99,45 +110,65 @@ func New(opts Options) *App {
 // SetInterrupt wires Ctrl-C to the agent (call after the agent is built).
 func (a *App) SetInterrupt(f func()) { a.interrupt = f }
 
-// Run runs the TUI until the user quits.
+// Run runs the TUI until the user quits. When it returns, any prompt that is
+// still waiting for an answer is released so the agent goroutine can stop.
 func (a *App) Run() error {
 	_, err := a.prog.Run()
+	a.closeOnce.Do(func() { close(a.closed) })
 	return err
 }
+
+// Quit asks the TUI to stop; safe to call from any goroutine.
+func (a *App) Quit() { a.prog.Quit() }
 
 // AwaitTask blocks until the user submits the initial task.
 func (a *App) AwaitTask() (string, error) {
 	return a.ask(inTask, "What do you want to do?")
 }
 
+// ShowUser displays a user message in the transcript (e.g. a task passed on
+// the command line). Messages typed in the TUI are echoed automatically.
+func (a *App) ShowUser(text string) {
+	a.prog.Send(blockMsg{userBlock{text: text}})
+}
+
 // Finish reports the run outcome and lets the user quit with ctrl-c.
 func (a *App) Finish(submission string, err error) {
-	var summary string
-	switch {
-	case err == nil:
-		summary = "Run complete."
-	case errors.Is(err, agent.ErrAborted):
-		summary = "Run aborted by user."
-	case errors.Is(err, agent.ErrLimitsExceeded):
-		summary = "Run ended: limits exceeded."
-	case errors.Is(err, context.Canceled):
-		summary = "Run canceled."
-	default:
-		summary = "Run failed: " + err.Error()
-	}
-	a.prog.Send(doneMsg(summary))
-	a.prog.Send(lineMsg(dimStyle.Render(strings.TrimSpace(submission))))
+	summary, ok := finishSummary(err)
+	a.prog.Send(doneMsg{summary: summary, ok: ok})
 	if a.autoQuit {
 		a.prog.Send(autoQuitMsg{})
+	}
+}
+
+func finishSummary(err error) (string, bool) {
+	switch {
+	case err == nil:
+		return "Run complete.", true
+	case errors.Is(err, agent.ErrAborted):
+		return "Run aborted by user.", false
+	case errors.Is(err, agent.ErrInterrupted):
+		return "Run interrupted.", false
+	case errors.Is(err, agent.ErrLimitsExceeded):
+		return "Run ended: limits exceeded.", false
+	case errors.Is(err, context.Canceled):
+		return "Run canceled.", false
+	default:
+		return "Run failed: " + err.Error(), false
 	}
 }
 
 func (a *App) ask(kind inputKind, title string) (string, error) {
 	reply := make(chan inputResult, 1)
 	a.prog.Send(inputReqMsg{kind: kind, title: title, reply: reply})
-	res := <-reply
+	var res inputResult
+	select {
+	case res = <-reply:
+	case <-a.closed:
+		return "", agent.ErrInterrupted
+	}
 	switch {
-	case res.aborted || res.cancelled:
+	case res.aborted:
 		return "", agent.ErrAborted
 	case res.interrupted:
 		return "", agent.ErrInterrupted
@@ -146,33 +177,30 @@ func (a *App) ask(kind inputKind, title string) (string, error) {
 }
 
 func (a *App) Info(format string, args ...any) {
-	a.prog.Send(lineMsg(infoStyle.Render("• " + fmt.Sprintf(format, args...))))
+	a.prog.Send(blockMsg{infoBlock{text: fmt.Sprintf(format, args...)}})
 }
 
 func (a *App) Assistant(step int, cost float32, msg types.Message) {
 	a.prog.Send(headerMsg{steps: step, cost: cost})
-	a.prog.Send(lineMsg(agentStyle.Render(fmt.Sprintf("stubbs (step %d, $%.4f):", step, cost))))
-	if strings.TrimSpace(msg.Content) != "" {
-		a.prog.Send(lineMsg(msg.Content))
+	calls := make([]string, len(msg.ToolCalls))
+	for i, call := range msg.ToolCalls {
+		calls[i] = agent.CommandOf(call)
 	}
-	for _, call := range msg.ToolCalls {
-		a.prog.Send(lineMsg(userStyle.Render("→ " + agent.CommandOf(call))))
-	}
+	a.prog.Send(blockMsg{assistantBlock{
+		step:    step,
+		cost:    cost,
+		content: msg.Content,
+		calls:   calls,
+	}})
 }
 
 func (a *App) Observation(call types.ToolCall, out types.ExecutionOutput) {
-	var b strings.Builder
-	fmt.Fprintf(&b, "%s exit=%d %s",
-		toolStyle.Render(call.Function.Name),
-		out.Code,
-		dimStyle.Render(out.Duration.Round(time.Millisecond).String()))
-	if strings.TrimSpace(out.Output) != "" {
-		b.WriteString("\n" + clip(out.Output, 60))
-	}
-	if out.Error != "" {
-		b.WriteString("\n" + infoStyle.Render(clip(out.Error, 10)))
-	}
-	a.prog.Send(lineMsg(b.String()))
+	a.prog.Send(blockMsg{toolBlock{
+		name:     call.Function.Name,
+		cmd:      agent.CommandOf(call),
+		out:      out,
+		expanded: true,
+	}})
 }
 
 func (a *App) Status(text string) { a.prog.Send(statusMsg(text)) }
@@ -180,18 +208,37 @@ func (a *App) Status(text string) { a.prog.Send(statusMsg(text)) }
 func (a *App) ModeChanged(m agent.Mode) { a.prog.Send(modeMsg(m)) }
 
 func (a *App) AskConfirm(commands []string) (string, error) {
-	title := fmt.Sprintf("Execute %d command(s)?  enter=approve · text=reject · /h=help", len(commands))
-	return a.ask(inConfirm, title)
+	reply := make(chan inputResult, 1)
+	a.prog.Send(inputReqMsg{kind: inConfirm, commands: commands, reply: reply})
+	return a.await(reply)
+}
+
+func (a *App) AskExit() (string, error) {
+	reply := make(chan inputResult, 1)
+	a.prog.Send(inputReqMsg{kind: inExit, reply: reply})
+	return a.await(reply)
+}
+
+func (a *App) await(reply chan inputResult) (string, error) {
+	var res inputResult
+	select {
+	case res = <-reply:
+	case <-a.closed:
+		return "", agent.ErrInterrupted
+	}
+	switch {
+	case res.aborted:
+		return "", agent.ErrAborted
+	case res.interrupted:
+		return "", agent.ErrInterrupted
+	}
+	return res.text, nil
 }
 
 func (a *App) AskCommand() (string, error) { return a.ask(inCommand, "Your command") }
 
 func (a *App) AskComment() (string, error) {
 	return a.ask(inComment, "Comment (ctrl-c again to abort)")
-}
-
-func (a *App) AskExit() (string, error) {
-	return a.ask(inExit, "Agent wants to finish · enter=submit · text=new task · /u=human mode")
 }
 
 func (a *App) AskNewLimits(curSteps, stepLimit int, curCost, costLimit float32) (int, float32, bool, error) {
@@ -201,7 +248,12 @@ func (a *App) AskNewLimits(curSteps, stepLimit int, curCost, costLimit float32) 
 		curCost: curCost, costLimit: costLimit,
 		reply: reply,
 	})
-	res := <-reply
+	var res inputResult
+	select {
+	case res = <-reply:
+	case <-a.closed:
+		return 0, 0, false, agent.ErrAborted
+	}
 	if res.aborted || res.interrupted {
 		return 0, 0, false, agent.ErrAborted
 	}
@@ -222,21 +274,42 @@ func (a *App) AskNewLimits(curSteps, stepLimit int, curCost, costLimit float32) 
 
 // --- bubbletea model ---
 
+// tLine is one rendered transcript line: the styled version for display and
+// its plain text for selection/copy.
+type tLine struct {
+	plain string
+	ansi  string
+}
+
 type model struct {
-	opts     Options
-	app      *App
-	width    int
-	height   int
-	lines    []string
-	vp       viewport.Model
-	ta       textarea.Model
-	status   string
-	mode     agent.Mode
-	steps    int
-	cost     float32
-	pending  *pendingInput
-	expanded bool
-	done     bool
+	opts      Options
+	app       *App
+	st        styles
+	w, h      int
+	inputH    int
+	blocks    []block
+	rows      []int // cumulative transcript line count per block
+	tLines    []tLine
+	selAnchor int // selection anchor line (-1 = no selection)
+	selHead   int // selection head line
+	selecting bool
+	stick     bool // follow the bottom of the transcript
+	showTools bool // global expand/collapse for tool output (start expanded)
+	dirty     bool
+	vp        viewport.Model
+	ta        textarea.Model
+	sp        spinner.Model
+	status    string
+	statusErr bool
+	working   bool
+	doneOk    bool
+	mode      agent.Mode
+	steps     int
+	cost      float32
+	pending   *pendingInput
+	dlg       *dialog
+	expanded  bool
+	done      bool
 }
 
 func newTextarea() textarea.Model {
@@ -245,28 +318,35 @@ func newTextarea() textarea.Model {
 	ta.Prompt = ""
 	ta.ShowLineNumbers = false
 	ta.CharLimit = 0
+	// bubbles paints the cursor line with a black background by default, which
+	// shows through as a dark band over the text being typed. Drop it.
+	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
+	ta.BlurredStyle.CursorLine = lipgloss.NewStyle()
 	ta.SetWidth(80)
 	ta.SetHeight(1)
 	ta.Focus()
 	return ta
 }
 
-func (m *model) Init() tea.Cmd { return textarea.Blink }
+func (m *model) Init() tea.Cmd {
+	return tea.Batch(textarea.Blink, m.sp.Tick)
+}
 
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		m.width, m.height = msg.Width, msg.Height
+		m.w, m.h = msg.Width, msg.Height
 		m.layout()
 		return m, nil
 
-	case lineMsg:
-		m.lines = append(m.lines, string(msg))
-		m.syncViewport()
+	case blockMsg:
+		m.appendBlock(msg.b)
 		return m, nil
 
 	case statusMsg:
 		m.status = string(msg)
+		m.statusErr = false
+		m.working = true
 		return m, nil
 
 	case headerMsg:
@@ -278,6 +358,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case inputReqMsg:
+		m.working = false
+		if msg.kind == inConfirm || msg.kind == inExit {
+			d := &dialog{reply: msg.reply}
+			if msg.kind == inConfirm {
+				d.kind, d.commands, d.options = dlgConfirm, msg.commands, confirmOptions()
+			} else {
+				d.kind, d.options = dlgExit, exitOptions()
+			}
+			m.dlg = d
+			m.layout()
+			return m, nil
+		}
 		m.pending = &pendingInput{kind: msg.kind, title: msg.title, reply: msg.reply}
 		m.ta.Placeholder = m.placeholderFor(msg.kind)
 		m.ta.Reset()
@@ -285,54 +377,106 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, textarea.Blink
 
 	case limitsReqMsg:
+		m.working = false
 		m.pending = &pendingInput{kind: inLimits, title: "Raise limits", reply: msg.reply}
-		m.ta.Placeholder = fmt.Sprintf("new limits, e.g. '%d %.2f'  ·  q to end run", msg.stepLimit, msg.costLimit)
+		m.ta.Placeholder = fmt.Sprintf("new limits, e.g. '%d %.2f'  ·  q ends the run", msg.stepLimit, msg.costLimit)
 		m.ta.Reset()
 		m.ta.Focus()
 		return m, textarea.Blink
 
 	case doneMsg:
 		m.done = true
+		m.working = false
 		m.pending = nil
-		m.status = string(msg)
+		m.dlg = nil
+		m.status = msg.summary + " — ctrl+c or esc to quit"
+		m.doneOk = msg.ok
+		m.statusErr = !msg.ok
 		m.ta.Reset()
 		m.ta.Blur()
+		m.layout()
+		if msg.ok {
+			m.appendBlock(okBlock{text: msg.summary})
+		} else {
+			m.appendBlock(errorBlock{text: msg.summary})
+		}
 		return m, nil
 
 	case autoQuitMsg:
 		return m, tea.Quit
+
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.sp, cmd = m.sp.Update(msg)
+		return m, cmd
+
+	case copiedMsg:
+		m.working = false
+		m.status = fmt.Sprintf("copied %d line%s to clipboard", int(msg), pluralLines(int(msg)))
+		return m, nil
+
+	case tea.MouseMsg:
+		var cmd tea.Cmd
+		m.vp, cmd = m.vp.Update(msg)
+		if cp := m.handleMouse(msg); cp != nil {
+			cmd = tea.Batch(cmd, cp)
+		}
+		if !m.vp.AtBottom() {
+			m.stick = false // the user scrolled up; stop auto-follow
+		}
+		return m, cmd
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
 
 	var cmds []tea.Cmd
+	if m.dlg == nil {
+		cmds = append(cmds, m.updateTA(msg))
+	}
 	var cmd tea.Cmd
-	m.ta, cmd = m.ta.Update(msg)
-	cmds = append(cmds, cmd)
 	m.vp, cmd = m.vp.Update(msg)
 	cmds = append(cmds, cmd)
+	if !m.vp.AtBottom() {
+		m.stick = false // the user scrolled up; stop auto-follow
+	}
 	return m, tea.Batch(cmds...)
 }
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.selAnchor >= 0 {
+		m.clearSelection()
+	}
+	if m.dlg != nil {
+		return m.handleDialogKey(msg.String())
+	}
 	switch msg.String() {
 	case "ctrl+c":
 		if m.done {
 			return m, tea.Quit
 		}
-		if m.pending != nil {
-			res := inputResult{interrupted: true}
-			if m.pending.kind == inComment || m.pending.kind == inLimits {
-				res = inputResult{aborted: true}
+		return m.interruptKey()
+
+	case "esc":
+		if m.done {
+			return m, tea.Quit
+		}
+		return m.interruptKey()
+
+	case "ctrl+o":
+		m.showTools = !m.showTools
+		for i, b := range m.blocks {
+			if tb, ok := b.(toolBlock); ok {
+				tb.expanded = m.showTools
+				m.blocks[i] = tb
 			}
-			m.resolve(res)
-			return m, nil
 		}
-		if m.app != nil && m.app.interrupt != nil {
-			m.app.interrupt()
-			m.status = "interrupting — tell the agent what happened…"
-		}
+		m.dirty = true
+		return m, nil
+
+	case "ctrl+e":
+		m.expanded = !m.expanded
+		m.layout()
 		return m, nil
 
 	case "enter":
@@ -340,18 +484,141 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.submitPending()
 			return m, nil
 		}
-		m.status = "agent is busy — press ctrl-c to interrupt"
-		return m, nil
-
-	case "ctrl+e":
-		m.expanded = !m.expanded
-		m.layout()
+		if !m.done {
+			m.status = "agent is busy — ctrl-c interrupts"
+		}
 		return m, nil
 	}
 
+	return m, m.updateTA(msg)
+}
+
+// updateTA forwards msg to the composer and re-lays out the view when the
+// content grows or shrinks, so the box keeps the cursor visible.
+func (m *model) updateTA(msg tea.Msg) tea.Cmd {
+	before := m.desiredInputH()
 	var cmd tea.Cmd
-	m.ta, cmd = m.ta.Update(msg) // ctrl+j inserts a newline
-	return m, cmd
+	m.ta, cmd = m.ta.Update(msg)
+	if m.desiredInputH() != before {
+		m.layout()
+	}
+	return cmd
+}
+
+func (m *model) handleDialogKey(key string) (tea.Model, tea.Cmd) {
+	d := m.dlg
+	switch key {
+	case "ctrl+c":
+		if m.done {
+			return m, tea.Quit
+		}
+		if d.reply != nil {
+			m.resolveReply(d.reply, inputResult{interrupted: true})
+		} else {
+			m.dlg = nil
+		}
+		return m, nil
+
+	case "esc":
+		switch d.kind {
+		case dlgHelp:
+			m.dlg = nil
+		case dlgConfirm:
+			m.swapComposer(inReject, "Rejecting — what went wrong?", "what should the agent do instead? · ctrl-c=abort")
+		default: // exit: esc finishes
+			m.resolveReply(d.reply, inputResult{})
+		}
+		return m, nil
+
+	case "up", "k":
+		d.selected = (d.selected + len(d.options) - 1) % len(d.options)
+		return m, nil
+
+	case "down", "j", "tab":
+		d.selected = (d.selected + 1) % len(d.options)
+		return m, nil
+
+	case "enter":
+		if d.kind == dlgHelp {
+			m.dlg = nil
+			return m, nil
+		}
+		m.pickDialogOption()
+		return m, nil
+
+	case "y":
+		if d.kind != dlgHelp {
+			d.selected = 0
+			m.pickDialogOption()
+		}
+		return m, nil
+
+	case "n":
+		if d.kind == dlgExit {
+			d.selected = 1
+			m.pickDialogOption()
+		}
+		return m, nil
+
+	case "h":
+		if d.kind == dlgExit {
+			d.selected = 2
+			m.pickDialogOption()
+		}
+		return m, nil
+
+	case "q":
+		if d.kind == dlgHelp {
+			m.dlg = nil
+		}
+		return m, nil
+	}
+	return m, nil // the modal swallows everything else
+}
+
+func (m *model) pickDialogOption() {
+	d := m.dlg
+	if d.selected >= len(d.options) {
+		d.selected = 0
+	}
+	o := d.options[d.selected]
+	switch o.action {
+	case dlgReject:
+		m.swapComposer(inReject, "Rejecting — what went wrong?", m.placeholderFor(inReject))
+	case dlgNewTask:
+		m.swapComposer(inTask, "New task", m.placeholderFor(inTask))
+	default:
+		m.resolveReply(d.reply, inputResult{text: o.text})
+	}
+}
+
+// swapComposer turns the active dialog into a composer prompt that answers
+// the same pending request.
+func (m *model) swapComposer(kind inputKind, title string, placeholder string) {
+	m.pending = &pendingInput{kind: kind, title: title, reply: m.dlg.reply}
+	m.dlg = nil
+	m.ta.Reset()
+	m.ta.Placeholder = placeholder
+	m.ta.Focus()
+	m.layout()
+}
+
+func (m *model) interruptKey() (tea.Model, tea.Cmd) {
+	if m.pending != nil {
+		res := inputResult{interrupted: true}
+		switch m.pending.kind {
+		case inComment, inLimits, inReject:
+			res = inputResult{aborted: true}
+		}
+		m.resolve(res)
+		return m, nil
+	}
+	if m.app != nil && m.app.interrupt != nil {
+		m.app.interrupt()
+		m.status = "interrupting — tell the agent what happened…"
+		m.working = true
+	}
+	return m, nil
 }
 
 func (m *model) submitPending() {
@@ -367,8 +634,8 @@ func (m *model) submitPending() {
 		cost, err2 := fieldFloat(fields, 1)
 		if err1 != nil || err2 != nil || steps <= 0 || cost < 0 {
 			m.ta.Reset()
-			m.lines = append(m.lines, infoStyle.Render("• Enter '<steps> <cost>' (e.g. '24 5'), or q to end the run."))
-			m.syncViewport()
+			m.statusErr = true
+			m.status = "enter '<steps> <cost>' (e.g. '24 5'), or q to end the run"
 			return
 		}
 		m.resolve(inputResult{text: fmt.Sprintf("%d %v", steps, cost)})
@@ -381,6 +648,22 @@ func (m *model) submitPending() {
 		m.ta.Reset()
 		return
 	}
+	// TUI-side: /h opens the help overlay instead of going to the agent.
+	if strings.TrimSpace(text) == "/h" {
+		m.ta.Reset()
+		m.dlg = newHelpDialog()
+		m.layout()
+		return
+	}
+	// Echo conversation messages into the transcript so the user can see
+	// (and select) their own input. Commands in human mode are rendered by
+	// the agent; limits are not conversation.
+	switch m.pending.kind {
+	case inTask, inComment, inReject:
+		if t := strings.TrimSpace(text); t != "" {
+			m.appendBlock(userBlock{text: t})
+		}
+	}
 	m.resolve(inputResult{text: text})
 }
 
@@ -390,94 +673,312 @@ func (m *model) resolve(res inputResult) {
 	}
 	reply := m.pending.reply
 	m.pending = nil
-	m.status = ""
-	m.ta.Reset()
-	m.ta.Placeholder = idlePlaceholder
-	m.layout()
+	m.resetPrompt()
 	if reply != nil {
 		reply <- res
 	}
 }
 
+func (m *model) resolveReply(reply chan inputResult, res inputResult) {
+	m.resetPrompt()
+	if reply != nil {
+		reply <- res
+	}
+}
+
+func (m *model) resetPrompt() {
+	m.status = ""
+	m.statusErr = false
+	m.working = false
+	m.ta.Reset()
+	m.ta.Placeholder = idlePlaceholder
+	m.ta.Focus()
+	m.dlg = nil
+	m.layout()
+}
+
 func (m *model) placeholderFor(kind inputKind) string {
 	switch kind {
-	case inConfirm:
-		return "enter=approve · text=reject comment · /h=help"
+	case inTask:
+		return "describe the task…"
 	case inCommand:
 		return "your command · /h=help"
-	case inComment:
+	case inComment, inReject:
 		return "what should the agent do instead? · ctrl-c=abort"
-	case inExit:
-		return "enter=submit · text=new task · /u=human mode"
-	case inTask:
-		return "What do you want to do?"
 	}
 	return ""
 }
 
-func (m *model) layout() {
-	if m.width == 0 {
-		return
+// handleMouse implements select-and-copy over the transcript. A press sets
+// the anchor, a drag moves the head, and a release copies the selected
+// lines. A click without a drag keeps its old meaning: toggle a tool block.
+func (m *model) handleMouse(msg tea.MouseMsg) tea.Cmd {
+	if m.dlg != nil {
+		return nil
 	}
-	inputH := 1
-	if m.expanded {
-		inputH = 8
+	row := msg.Y - 1 // -1: header row
+	if row < 0 || row >= m.vp.Height {
+		return nil
 	}
-	// header + prompt title + input box (border adds 2) + status + hint
-	used := 1 + 1 + inputH + 2 + 1 + 1
-	m.vp.Width = m.width
-	m.vp.Height = max(m.height-used, 1)
-	m.ta.SetWidth(max(m.width-4, 1))
-	m.ta.SetHeight(inputH)
-	m.syncViewport()
+	line := m.vp.YOffset + row
+	switch {
+	case msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft:
+		m.selecting = true
+		m.selAnchor, m.selHead = line, line
+		m.applySelection()
+
+	case msg.Action == tea.MouseActionMotion && msg.Button == tea.MouseButtonLeft && m.selecting:
+		if line >= 0 && line < len(m.tLines) && line != m.selHead {
+			m.selHead = line
+			m.applySelection()
+		}
+
+	case msg.Action == tea.MouseActionRelease && msg.Button == tea.MouseButtonLeft && m.selecting:
+		m.selecting = false
+		if m.selAnchor < 0 || m.selAnchor >= len(m.tLines) {
+			return nil
+		}
+		if m.selAnchor == m.selHead {
+			line := m.selAnchor // plain click: keep the old toggle behavior
+			m.clearSelection()
+			m.toggleBlockAt(line)
+			return nil
+		}
+		lo, hi := m.selRange()
+		text := m.selectedText(lo, hi)
+		if strings.TrimSpace(text) == "" {
+			return nil
+		}
+		return copyCmd(text, hi-lo+1)
+	}
+	return nil
 }
 
-func (m *model) syncViewport() {
-	wrap := lipgloss.NewStyle().Width(max(m.vp.Width, 1))
-	rendered := make([]string, len(m.lines))
-	for i, line := range m.lines {
-		rendered[i] = wrap.Render(line)
+// selRange returns the ordered selection bounds; empty range when inactive.
+func (m *model) selRange() (lo, hi int) {
+	if m.selAnchor < 0 {
+		return 1, 0
 	}
-	m.vp.SetContent(strings.Join(rendered, "\n"))
-	m.vp.GotoBottom()
+	lo, hi = m.selAnchor, m.selHead
+	if lo > hi {
+		lo, hi = hi, lo
+	}
+	if hi >= len(m.tLines) {
+		hi = len(m.tLines) - 1
+	}
+	if lo < 0 {
+		lo = 0
+	}
+	return lo, hi
+}
+
+// selectedText joins the plain text of the selected lines.
+func (m *model) selectedText(lo, hi int) string {
+	lines := make([]string, 0, hi-lo+1)
+	for i := lo; i <= hi; i++ {
+		lines = append(lines, strings.TrimRight(m.tLines[i].plain, " "))
+	}
+	for len(lines) > 0 && lines[0] == "" {
+		lines = lines[1:]
+	}
+	for len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m *model) clearSelection() {
+	m.selAnchor, m.selHead = -1, -1
+	m.applySelection()
+}
+
+// copyCmd pushes text to the system clipboard: OSC52 first (works over SSH
+// with capable terminals), then the native clipboard.
+func copyCmd(text string, lines int) tea.Cmd {
+	return func() tea.Msg {
+		// OSC52 only helps when the native clipboard is out of reach (SSH).
+		// Emitting it locally races the renderer on os.Stdout, so skip it there.
+		if len(text) <= 100_000 && (os.Getenv("SSH_TTY") != "" || os.Getenv("SSH_CONNECTION") != "") {
+			fmt.Fprint(os.Stdout, osc52.New(text).String())
+		}
+		_ = clipboard.WriteAll(text)
+		return copiedMsg(lines)
+	}
+}
+
+func pluralLines(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
+// toggleBlockAt expands/collapses the tool block owning the given
+// transcript line index.
+func (m *model) toggleBlockAt(row int) {
+	if row < 0 {
+		return
+	}
+	for i, end := range m.rows {
+		if row < end {
+			if tb, ok := m.blocks[i].(toolBlock); ok {
+				tb.expanded = !tb.expanded
+				m.blocks[i] = tb
+				m.dirty = true
+			}
+			return
+		}
+	}
+}
+
+func (m *model) appendBlock(b block) {
+	if m.vp.AtBottom() || m.vp.Height == 0 {
+		m.stick = true
+	}
+	m.blocks = append(m.blocks, b)
+	m.dirty = true
+}
+
+func (m *model) layout() {
+	if m.w == 0 {
+		return
+	}
+	m.inputH = m.desiredInputH()
+	m.vp.Width = m.w
+	m.vp.Height = max(m.h-m.usedRows(), 1)
+	m.ta.SetWidth(max(m.w-2, 1))
+	m.ta.SetHeight(m.inputH)
+	m.dirty = true
+}
+
+// desiredInputH is the composer height needed to show all of its content:
+// one row per logical line plus extra rows for long lines that wrap. The
+// expanded flag (ctrl+e, /m) acts as a minimum height, and the result is
+// capped so the transcript viewport always keeps at least one row.
+func (m *model) desiredInputH() int {
+	w := max(m.w-2, 1) // same width layout() gives the textarea
+	rows := 0
+	for _, l := range strings.Split(m.ta.Value(), "\n") {
+		rows += max(1, (plainWidth(l)+w-1)/w)
+	}
+	if m.expanded {
+		rows = max(rows, 8)
+	}
+	return min(rows, max(m.h-4, 1))
+}
+
+// usedRows counts every transcript-external row the view needs.
+func (m *model) usedRows() int {
+	used := 2 // header + status line
+	if m.dlg != nil {
+		used += lipgloss.Height(m.dlg.render(m.w, m.st))
+	} else {
+		if m.pending != nil {
+			used++
+		}
+		used += m.inputH + 2 // composer border
+	}
+	return used
+}
+
+func (m *model) renderTranscript() {
+	w := max(m.vp.Width, 1)
+	rows := make([]int, len(m.blocks))
+	lines := make([]tLine, 0, 64)
+	total := 0
+	for i, b := range m.blocks {
+		r := b.render(w, m.st)
+		for _, ln := range strings.Split(r, "\n") {
+			lines = append(lines, tLine{plain: ansi.Strip(ln), ansi: ln})
+		}
+		total += strings.Count(r, "\n") + 1
+		rows[i] = total
+		lines = append(lines, tLine{}) // blank line between blocks
+		total++
+	}
+	m.rows = rows
+	m.tLines = lines
+	m.dirty = false
+	m.applySelection()
+	if m.stick {
+		m.vp.GotoBottom()
+	}
+}
+
+// applySelection rebuilds the viewport content from the cached transcript
+// lines, highlighting the selected range. Cheap: no block re-rendering.
+func (m *model) applySelection() {
+	if len(m.tLines) == 0 {
+		return
+	}
+	lo, hi := m.selRange()
+	parts := make([]string, len(m.tLines))
+	for i, l := range m.tLines {
+		if i >= lo && i <= hi {
+			txt := l.plain
+			if strings.TrimSpace(txt) == "" {
+				txt = " "
+			}
+			parts[i] = m.st.selLine.Render(txt)
+		} else {
+			parts[i] = l.ansi
+		}
+	}
+	m.vp.SetContent(strings.Join(parts, "\n"))
+}
+
+func (m *model) busy() bool {
+	return m.working && !m.done && m.pending == nil && m.dlg == nil
+}
+
+func (m *model) statusLine() string {
+	if m.busy() {
+		return m.sp.View() + " " + m.st.info.Render(m.status)
+	}
+	if m.status == "" {
+		return m.st.faint.Render("ready")
+	}
+	if m.done && m.doneOk {
+		return m.st.ok.Render("● " + m.status)
+	}
+	if m.statusErr {
+		return m.st.errStyle.Render("● " + m.status)
+	}
+	return m.st.dim.Render(m.status)
+}
+
+func (m *model) header() string {
+	left := m.st.title.Render("stubbs") + " " + m.st.modeBadge(m.mode.String())
+	right := m.st.faint.Render(m.opts.Model) +
+		m.st.dim.Render(fmt.Sprintf(" · step %d · $%.4f", m.steps, m.cost))
+	if pad := m.w - plainWidth(left) - plainWidth(right); pad >= 1 {
+		return left + strings.Repeat(" ", pad) + right
+	}
+	return wrapAt(m.w).Render(left)
 }
 
 func (m *model) View() string {
-	if m.width == 0 {
+	if m.w == 0 {
 		return "loading…"
 	}
-	header := titleStyle.Render(" stubbs ") +
-		dimStyle.Render(fmt.Sprintf("· mode %s · step %d · $%.4f · %s", m.mode, m.steps, m.cost, m.opts.Model))
-	title := ""
-	if m.pending != nil {
-		title = infoStyle.Render(m.pending.title)
+	if m.dirty {
+		m.renderTranscript()
 	}
-	status := m.status
-	if strings.TrimSpace(status) == "" {
-		status = "ready"
+	var bottom []string
+	if m.dlg != nil {
+		sheet := lipgloss.PlaceHorizontal(m.w, lipgloss.Center, m.dlg.render(m.w, m.st))
+		bottom = append(bottom, sheet)
+	} else {
+		if m.pending != nil {
+			bottom = append(bottom, m.st.agent.Render("❯ ")+m.st.info.Render(m.pending.title))
+		}
+		box := m.st.box
+		if m.pending != nil || (!m.done && m.status == "") {
+			box = m.st.boxFocus
+		}
+		bottom = append(bottom, box.Render(m.ta.View()))
 	}
-	return lipgloss.JoinVertical(lipgloss.Left,
-		header,
-		m.vp.View(),
-		title,
-		dimStyle.Render(status),
-		boxStyle.Render(m.ta.View()),
-		dimStyle.Render("enter submit · ctrl+j newline · ctrl+e expand · /h help · ctrl-c interrupt"),
-	)
-}
-
-func clip(s string, maxLines int) string {
-	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
-	if len(lines) <= maxLines {
-		return s
-	}
-	head := maxLines * 2 / 3
-	tail := maxLines - head
-	hidden := len(lines) - head - tail
-	out := append([]string{}, lines[:head]...)
-	out = append(out, dimStyle.Render(fmt.Sprintf("… [%d lines hidden] …", hidden)))
-	out = append(out, lines[len(lines)-tail:]...)
-	return strings.Join(out, "\n")
+	return lipgloss.JoinVertical(lipgloss.Left, m.header(), m.vp.View(), m.statusLine(), strings.Join(bottom, "\n"))
 }
 
 func fieldInt(fields []string, i int) (int, error) {

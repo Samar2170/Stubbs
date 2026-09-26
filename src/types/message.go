@@ -5,6 +5,8 @@ const (
 	RoleAssistant = "assistant"
 	RoleSystem    = "system"
 	RoleTool      = "tool"
+
+	RepoMap = "repository-map"
 )
 
 type Message struct {

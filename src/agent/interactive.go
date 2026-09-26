@@ -102,7 +102,7 @@ func NewInteractiveAgent(cfg InteractiveConfig, client llm.ModelClient, environ 
 	if ui == nil {
 		return nil, fmt.Errorf("agent: interactive agent requires a UI")
 	}
-	base, err := NewAgent(&cfg.AgentConfig, client, environ, model)
+	base, err := NewAgent(&cfg.AgentConfig, client, environ, model, false)
 	if err != nil {
 		return nil, err
 	}
@@ -216,7 +216,13 @@ func (ia *InteractiveAgent) Run(ctx context.Context, task string) (string, error
 			continue
 		}
 		ia.ui.Status(fmt.Sprintf("running %s...", plural(len(msg.ToolCalls), "command")))
-		outputs, err := a.executeRuns(ctx, msg.ToolCalls)
+		// Register a cancel for tool execution too, so ESC/ctrl-c can stop a
+		// long-running command instead of leaving the UI apparently frozen.
+		runCtx, cancelRuns := context.WithCancel(ctx)
+		ia.setStepCancel(cancelRuns)
+		outputs, err := a.executeRuns(runCtx, msg.ToolCalls)
+		ia.setStepCancel(nil)
+		cancelRuns()
 		if err != nil {
 			return "", err
 		}
@@ -234,14 +240,10 @@ func (ia *InteractiveAgent) modelStep(ctx context.Context) (types.Message, error
 	for {
 		ia.ui.Status("waiting for LLM...")
 		sctx, cancel := context.WithCancel(ctx)
-		ia.stepMu.Lock()
-		ia.stepCancel = cancel
-		ia.stepMu.Unlock()
+		ia.setStepCancel(cancel)
 		msg, err := ia.Agent.respond(sctx)
 		cancel()
-		ia.stepMu.Lock()
-		ia.stepCancel = nil
-		ia.stepMu.Unlock()
+		ia.setStepCancel(nil)
 		if err == nil {
 			return msg, nil
 		}
@@ -375,6 +377,14 @@ func (ia *InteractiveAgent) Interrupt() {
 	if cancel != nil {
 		cancel()
 	}
+}
+
+// setStepCancel records the cancel func of the operation currently in flight
+// (a model call or a batch of tool executions) so Interrupt can cancel it.
+func (ia *InteractiveAgent) setStepCancel(cancel context.CancelFunc) {
+	ia.stepMu.Lock()
+	ia.stepCancel = cancel
+	ia.stepMu.Unlock()
 }
 
 func (ia *InteractiveAgent) takeInterrupt() bool {
