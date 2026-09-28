@@ -78,6 +78,21 @@ func (a *Agent) Run(ctx context.Context, task string) (string, error) {
 	return resp, nil
 }
 
+// SetModel switches the model used for subsequent requests and records the
+// change on the session. It is a no-op when the model is already active.
+func (a *Agent) SetModel(model string) {
+	if a == nil || model == "" || a.Model == model {
+		return
+	}
+	if sw, ok := a.ModelClient.(interface{ SetModel(string) }); ok {
+		sw.SetModel(model)
+	}
+	a.Model = model
+	if a.Session != nil {
+		a.Session.SetModel(model)
+	}
+}
+
 func (a *Agent) appendMessage(msg types.Message) error {
 	if err := a.Session.Append(msg); err != nil {
 		return fmt.Errorf("append to session: %w", err)

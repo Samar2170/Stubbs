@@ -17,6 +17,7 @@ func (s *stubUI) Observation(call types.ToolCall, out types.ExecutionOutput) {
 }
 func (s *stubUI) Status(text string)                           {}
 func (s *stubUI) ModeChanged(m Mode)                           {}
+func (s *stubUI) ModelChanged(model string)                    {}
 func (s *stubUI) AskConfirm(commands []string) (string, error) { return "", nil }
 func (s *stubUI) AskCommand() (string, error)                  { return "", nil }
 func (s *stubUI) AskComment() (string, error)                  { return "", nil }

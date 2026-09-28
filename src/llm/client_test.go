@@ -1,0 +1,18 @@
+package llm
+
+import "testing"
+
+func TestORClientSetModel(t *testing.T) {
+	c := NewORClient("key", []string{"a/one"}, nil)
+	if got := c.Model(); got != "a/one" {
+		t.Fatalf("Model() = %q, want a/one", got)
+	}
+	c.SetModel("b/two")
+	if got := c.Model(); got != "b/two" {
+		t.Fatalf("Model() after SetModel = %q, want b/two", got)
+	}
+	c.SetModel("")
+	if got := c.Model(); got != "b/two" {
+		t.Fatalf("SetModel(\"\") should be ignored, got %q", got)
+	}
+}

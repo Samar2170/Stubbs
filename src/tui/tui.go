@@ -72,6 +72,22 @@ type doneMsg struct {
 }
 type autoQuitMsg struct{}
 
+// ModelChoice is a selectable entry from the provider's model catalog.
+type ModelChoice struct {
+	ID   string
+	Name string
+}
+
+type modelMsg string
+type modelsLoadedMsg struct {
+	models []ModelChoice
+	err    error
+}
+type modelSwitchedMsg struct {
+	id  string
+	err error
+}
+
 const idlePlaceholder = "Type here…  (/h for help)"
 
 type Options struct {
@@ -86,6 +102,8 @@ type Options struct {
 type App struct {
 	prog      *tea.Program
 	interrupt func()
+	modelsFn  func() ([]ModelChoice, error)
+	switchFn  func(id string) error
 	autoQuit  bool
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -109,6 +127,13 @@ func New(opts Options) *App {
 
 // SetInterrupt wires Ctrl-C to the agent (call after the agent is built).
 func (a *App) SetInterrupt(f func()) { a.interrupt = f }
+
+// SetModelHandlers wires the model catalog fetch and the switch callbacks used
+// by the /models picker.
+func (a *App) SetModelHandlers(fetch func() ([]ModelChoice, error), switchTo func(string) error) {
+	a.modelsFn = fetch
+	a.switchFn = switchTo
+}
 
 // Run runs the TUI until the user quits. When it returns, any prompt that is
 // still waiting for an answer is released so the agent goroutine can stop.
@@ -206,6 +231,8 @@ func (a *App) Observation(call types.ToolCall, out types.ExecutionOutput) {
 func (a *App) Status(text string) { a.prog.Send(statusMsg(text)) }
 
 func (a *App) ModeChanged(m agent.Mode) { a.prog.Send(modeMsg(m)) }
+
+func (a *App) ModelChanged(model string) { a.prog.Send(modelMsg(model)) }
 
 func (a *App) AskConfirm(commands []string) (string, error) {
 	reply := make(chan inputResult, 1)
@@ -357,6 +384,39 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.mode = agent.Mode(msg)
 		return m, nil
 
+	case modelMsg:
+		m.opts.Model = string(msg)
+		return m, nil
+
+	case modelsLoadedMsg:
+		m.working = false
+		if msg.err != nil {
+			m.statusErr = true
+			m.status = "could not load models: " + msg.err.Error()
+			return m, nil
+		}
+		if len(msg.models) == 0 {
+			m.statusErr = true
+			m.status = "no models available"
+			return m, nil
+		}
+		m.status = ""
+		m.statusErr = false
+		m.dlg = newModelsDialog(msg.models)
+		m.layout()
+		return m, nil
+
+	case modelSwitchedMsg:
+		m.working = false
+		if msg.err != nil {
+			m.statusErr = true
+			m.status = "switch failed: " + msg.err.Error()
+			return m, nil
+		}
+		m.statusErr = false
+		m.status = "model: " + msg.id
+		return m, nil
+
 	case inputReqMsg:
 		m.working = false
 		if msg.kind == inConfirm || msg.kind == inExit {
@@ -481,8 +541,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "enter":
 		if m.pending != nil {
-			m.submitPending()
-			return m, nil
+			return m, m.submitPending()
 		}
 		if !m.done {
 			m.status = "agent is busy — ctrl-c interrupts"
@@ -507,6 +566,45 @@ func (m *model) updateTA(msg tea.Msg) tea.Cmd {
 
 func (m *model) handleDialogKey(key string) (tea.Model, tea.Cmd) {
 	d := m.dlg
+	if d.kind == dlgModels {
+		switch key {
+		case "ctrl+c":
+			if m.done {
+				return m, tea.Quit
+			}
+			m.dlg = nil
+			m.layout()
+			return m, nil
+		case "esc":
+			m.dlg = nil
+			m.layout()
+			return m, nil
+		case "up", "shift+tab":
+			if n := len(d.options); n > 0 {
+				d.selected = (d.selected + n - 1) % n
+			}
+			return m, nil
+		case "down", "tab":
+			if n := len(d.options); n > 0 {
+				d.selected = (d.selected + 1) % n
+			}
+			return m, nil
+		case "enter":
+			return m, m.pickDialogOption()
+		case "backspace":
+			if d.filter != "" {
+				d.filter = d.filter[:len(d.filter)-1]
+				d.applyFilter()
+			}
+			return m, nil
+		default:
+			if r := []rune(key); len(r) == 1 && r[0] >= 0x20 {
+				d.filter += key
+				d.applyFilter()
+			}
+			return m, nil
+		}
+	}
 	switch key {
 	case "ctrl+c":
 		if m.done {
@@ -543,27 +641,26 @@ func (m *model) handleDialogKey(key string) (tea.Model, tea.Cmd) {
 			m.dlg = nil
 			return m, nil
 		}
-		m.pickDialogOption()
-		return m, nil
+		return m, m.pickDialogOption()
 
 	case "y":
 		if d.kind != dlgHelp {
 			d.selected = 0
-			m.pickDialogOption()
+			return m, m.pickDialogOption()
 		}
 		return m, nil
 
 	case "n":
 		if d.kind == dlgExit {
 			d.selected = 1
-			m.pickDialogOption()
+			return m, m.pickDialogOption()
 		}
 		return m, nil
 
 	case "h":
 		if d.kind == dlgExit {
 			d.selected = 2
-			m.pickDialogOption()
+			return m, m.pickDialogOption()
 		}
 		return m, nil
 
@@ -576,12 +673,21 @@ func (m *model) handleDialogKey(key string) (tea.Model, tea.Cmd) {
 	return m, nil // the modal swallows everything else
 }
 
-func (m *model) pickDialogOption() {
+func (m *model) pickDialogOption() tea.Cmd {
 	d := m.dlg
+	if d == nil {
+		return nil
+	}
 	if d.selected >= len(d.options) {
 		d.selected = 0
 	}
+	if len(d.options) == 0 {
+		return nil
+	}
 	o := d.options[d.selected]
+	if d.kind == dlgModels {
+		return m.switchModel(o.text)
+	}
 	switch o.action {
 	case dlgReject:
 		m.swapComposer(inReject, "Rejecting — what went wrong?", m.placeholderFor(inReject))
@@ -589,6 +695,43 @@ func (m *model) pickDialogOption() {
 		m.swapComposer(inTask, "New task", m.placeholderFor(inTask))
 	default:
 		m.resolveReply(d.reply, inputResult{text: o.text})
+	}
+	return nil
+}
+
+// switchModel asks the app to switch (and persist) the active model. It runs
+// off the Update loop so the blocking call and the resulting UI notification
+// cannot deadlock the tea program.
+func (m *model) switchModel(id string) tea.Cmd {
+	if id == "" {
+		return nil
+	}
+	m.dlg = nil
+	m.working = true
+	m.statusErr = false
+	m.status = "switching to " + id + "…"
+	m.layout()
+	app := m.app
+	return func() tea.Msg {
+		if app == nil || app.switchFn == nil {
+			return modelSwitchedMsg{id: id, err: errors.New("model switching is not wired up")}
+		}
+		if err := app.switchFn(id); err != nil {
+			return modelSwitchedMsg{id: id, err: err}
+		}
+		return modelSwitchedMsg{id: id}
+	}
+}
+
+// loadModels fetches the provider's model catalog off the Update loop.
+func (m *model) loadModels() tea.Cmd {
+	app := m.app
+	return func() tea.Msg {
+		if app == nil || app.modelsFn == nil {
+			return modelsLoadedMsg{err: errors.New("model list is not wired up")}
+		}
+		models, err := app.modelsFn()
+		return modelsLoadedMsg{models: models, err: err}
 	}
 }
 
@@ -621,13 +764,13 @@ func (m *model) interruptKey() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *model) submitPending() {
+func (m *model) submitPending() tea.Cmd {
 	text := m.ta.Value()
 	if m.pending.kind == inLimits {
 		trimmed := strings.TrimSpace(text)
 		if strings.EqualFold(trimmed, "q") {
 			m.resolve(inputResult{cancelled: true})
-			return
+			return nil
 		}
 		fields := strings.Fields(trimmed)
 		steps, err1 := fieldInt(fields, 0)
@@ -636,24 +779,31 @@ func (m *model) submitPending() {
 			m.ta.Reset()
 			m.statusErr = true
 			m.status = "enter '<steps> <cost>' (e.g. '24 5'), or q to end the run"
-			return
+			return nil
 		}
 		m.resolve(inputResult{text: fmt.Sprintf("%d %v", steps, cost)})
-		return
+		return nil
 	}
 	// TUI-side: /m just expands the (already multiline) input box.
 	if strings.TrimSpace(text) == "/m" {
 		m.expanded = true
 		m.layout()
 		m.ta.Reset()
-		return
+		return nil
 	}
 	// TUI-side: /h opens the help overlay instead of going to the agent.
 	if strings.TrimSpace(text) == "/h" {
 		m.ta.Reset()
 		m.dlg = newHelpDialog()
 		m.layout()
-		return
+		return nil
+	}
+	// TUI-side: /models opens the model picker instead of going to the agent.
+	if strings.TrimSpace(text) == "/models" {
+		m.ta.Reset()
+		m.statusErr = false
+		m.status = "loading models…"
+		return m.loadModels()
 	}
 	// Echo conversation messages into the transcript so the user can see
 	// (and select) their own input. Commands in human mode are rendered by
@@ -665,6 +815,7 @@ func (m *model) submitPending() {
 		}
 	}
 	m.resolve(inputResult{text: text})
+	return nil
 }
 
 func (m *model) resolve(res inputResult) {

@@ -19,6 +19,7 @@ import (
 	"stubbs/src/types"
 	"sync"
 	"syscall"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/pflag"
@@ -74,7 +75,7 @@ func run() error {
 	if cfg.APIKey == "" {
 		return errors.New("no API key configured — run `stubbs --config` or set STUBBS_API_KEY")
 	}
-	model := orDefault(*modelF, cfg.Model)
+	model := orDefault(orDefault(*modelF, cfg.ActiveModel()), config.DefaultModel)
 
 	task := strings.TrimSpace(*taskF)
 	if task == "" && fs.NArg() > 0 {
@@ -137,6 +138,22 @@ func run() error {
 		return err
 	}
 	app.SetInterrupt(ia.Interrupt)
+	app.SetModelHandlers(func() ([]tui.ModelChoice, error) {
+		mctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		models, err := client.ListModels(mctx)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]tui.ModelChoice, len(models))
+		for i, m := range models {
+			out[i] = tui.ModelChoice{ID: m.ID, Name: m.Name}
+		}
+		return out, nil
+	}, func(id string) error {
+		ia.SetModel(id) // updates the client, the agent, the session and the header
+		return config.SaveModel(id)
+	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -201,15 +218,7 @@ func runWizard() error {
 	if err != nil {
 		return err
 	}
-	values := map[string]string{
-		"PROVIDER": newCfg.Provider,
-		"MODEL":    newCfg.Model,
-		"ENV":      newCfg.Env,
-	}
-	if newCfg.APIKey != "" {
-		values["API_KEY"] = newCfg.APIKey
-	}
-	if err := config.SaveConfig(config.ProjectConfigFile, values); err != nil {
+	if err := config.SaveConfig(newCfg); err != nil {
 		return fmt.Errorf("save config: %w", err)
 	}
 	if wasConfigured {

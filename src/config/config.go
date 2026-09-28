@@ -1,7 +1,6 @@
 package config
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,12 +8,14 @@ import (
 
 var DEBUG = true
 
-var ProjectDir string
-var SessionsDir string
-var ContextDir string
-var MemoryDir string
-
-var ProjectConfigFile string
+var (
+	ProjectDir        string
+	SessionsDir       string
+	ContextDir        string
+	MemoryDir         string
+	ProjectConfigFile string // config.yaml: everything except secrets
+	ProjectEnvFile    string // .env: the API key
+)
 
 func init() {
 	var homeDir string
@@ -29,13 +30,10 @@ func init() {
 	if err := os.MkdirAll(ProjectDir, os.ModePerm); err != nil {
 		panic(fmt.Errorf("create users dir: %w", err))
 	}
-	ProjectConfigFile = filepath.Join(ProjectDir, "stubbs.env")
-	if _, err := os.Stat(ProjectConfigFile); err != nil && errors.Is(err, os.ErrNotExist) {
-		_, err := os.Create(ProjectConfigFile)
-		if err != nil {
-			panic(err)
-		}
-	}
+
+	ProjectConfigFile = filepath.Join(ProjectDir, "config.yaml")
+	ProjectEnvFile = filepath.Join(ProjectDir, ".env")
+
 	SessionsDir = filepath.Join(ProjectDir, "sessions")
 	if err := os.MkdirAll(SessionsDir, os.ModePerm); err != nil {
 		panic(fmt.Errorf("create sessions dir: %w", err))

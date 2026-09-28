@@ -73,6 +73,7 @@ type UI interface {
 	Observation(call types.ToolCall, out types.ExecutionOutput)
 	Status(text string)
 	ModeChanged(m Mode)
+	ModelChanged(model string)
 	AskConfirm(commands []string) (string, error)
 	AskCommand() (string, error)
 	AskComment() (string, error)
@@ -129,6 +130,20 @@ func (ia *InteractiveAgent) SetMode(m Mode) {
 	ia.cfg.Mode = m
 	ia.ui.ModeChanged(m)
 	ia.ui.Info("Switched to %s mode.", m)
+}
+
+// SetModel switches the active model and reports the change to the UI.
+func (ia *InteractiveAgent) SetModel(model string) {
+	if model == "" {
+		return
+	}
+	if ia.Agent.Model == model {
+		ia.ui.Info("Already using %s.", model)
+		return
+	}
+	ia.Agent.SetModel(model)
+	ia.ui.ModelChanged(model)
+	ia.ui.Info("Switched to model %s.", model)
 }
 
 func (ia *InteractiveAgent) Run(ctx context.Context, task string) (string, error) {
@@ -618,6 +633,7 @@ func (ia *InteractiveAgent) printHelp() {
 	ia.ui.Info("/y — switch to yolo mode (execute LM commands without confirmation)")
 	ia.ui.Info("/c — switch to confirm mode (ask before executing LM commands)")
 	ia.ui.Info("/u — switch to human mode (execute commands issued by the user)")
+	ia.ui.Info("/models — browse and switch the active model")
 	ia.ui.Info("/m — expand the input box (multiline editing)")
 	ia.ui.Info("/h — show this help")
 }

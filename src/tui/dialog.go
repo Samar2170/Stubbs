@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -11,6 +13,7 @@ const (
 	dlgHelp dialogKind = iota
 	dlgConfirm
 	dlgExit
+	dlgModels
 )
 
 // dlgAction describes what picking an option does.
@@ -33,7 +36,61 @@ type dialog struct {
 	commands []string         // shown in the confirm dialog
 	reply    chan inputResult // nil for the help overlay
 	options  []dlgOption
+	all      []dlgOption // unfiltered options (models picker)
+	filter   string
 	selected int
+}
+
+const maxModelRows = 12
+
+func newModelsDialog(models []ModelChoice) *dialog {
+	opts := make([]dlgOption, 0, len(models))
+	for _, m := range models {
+		label := m.Name
+		if label == "" {
+			label = m.ID
+		} else if label != m.ID {
+			label = fmt.Sprintf("%s · %s", label, m.ID)
+		}
+		opts = append(opts, dlgOption{label: label, text: m.ID})
+	}
+	sort.Slice(opts, func(i, j int) bool { return opts[i].text < opts[j].text })
+	return &dialog{kind: dlgModels, all: opts, options: opts}
+}
+
+// applyFilter narrows the models list to the current filter string.
+func (d *dialog) applyFilter() {
+	f := strings.ToLower(strings.TrimSpace(d.filter))
+	if f == "" {
+		d.options = d.all
+	} else {
+		out := make([]dlgOption, 0, len(d.all))
+		for _, o := range d.all {
+			if strings.Contains(strings.ToLower(o.label), f) || strings.Contains(strings.ToLower(o.text), f) {
+				out = append(out, o)
+			}
+		}
+		d.options = out
+	}
+	if d.selected >= len(d.options) {
+		d.selected = 0
+	}
+}
+
+// visibleOptions returns the slice of options to draw and its offset. The
+// models picker is windowed around the selection so long catalogs stay usable.
+func (d *dialog) visibleOptions() ([]dlgOption, int) {
+	if d.kind != dlgModels || len(d.options) <= maxModelRows {
+		return d.options, 0
+	}
+	off := d.selected - maxModelRows/2
+	if off < 0 {
+		off = 0
+	}
+	if off > len(d.options)-maxModelRows {
+		off = len(d.options) - maxModelRows
+	}
+	return d.options[off : off+maxModelRows], off
 }
 
 func confirmOptions() []dlgOption {
@@ -77,6 +134,7 @@ func (d *dialog) render(width int, s styles) string {
 		lines = append(lines, helpRows(
 			[2]string{"/h", "this help"},
 			[2]string{"/u /c /y", "human · confirm · yolo mode"},
+			[2]string{"/models", "switch model"},
 			[2]string{"/m", "expand input box"},
 			[2]string{"q", "end run (limits prompt)"},
 		)...)
@@ -86,15 +144,32 @@ func (d *dialog) render(width int, s styles) string {
 			lines = append(lines, wrapAt(cw).Render(s.faint.Render("→ "+c)))
 		}
 		lines = append(lines, "")
+	case dlgModels:
+		lines = append(lines, s.agent.Render("select model"))
+		if d.filter != "" {
+			lines = append(lines, s.info.Render("filter: "+d.filter))
+		} else {
+			lines = append(lines, s.faint.Render("type to filter"))
+		}
+		lines = append(lines, "")
 	default: // exit
 		lines = append(lines, s.agent.Render("agent wants to finish"), "")
 	}
-	for i, o := range d.options {
-		if i == d.selected {
+	opts, offset := d.visibleOptions()
+	if d.kind == dlgModels && len(d.options) == 0 {
+		lines = append(lines, s.faint.Render("  no matches"))
+	}
+	for i, o := range opts {
+		if offset+i == d.selected {
 			lines = append(lines, s.sel.Render("❯ "+o.label))
 		} else {
 			lines = append(lines, s.option.Render("  "+o.label))
 		}
+	}
+	if d.kind == dlgModels {
+		lines = append(lines, "", s.faint.Render(fmt.Sprintf("%d/%d", min(d.selected+1, len(d.options)), len(d.options))))
+		lines = append(lines, s.faint.Render("↑/↓ move · type to filter · enter select · esc cancel"))
+		return s.dialog.Render(wrapAt(cw).Render(strings.Join(lines, "\n")))
 	}
 	lines = append(lines, "", s.faint.Render("↑/↓ move · enter select · esc cancel"))
 	return s.dialog.Render(wrapAt(cw).Render(strings.Join(lines, "\n")))
