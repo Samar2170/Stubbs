@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"stubbs/src/agent"
 	"stubbs/src/config"
@@ -18,6 +19,7 @@ import (
 	"stubbs/src/types"
 	"sync"
 	"syscall"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/pflag"
@@ -45,6 +47,8 @@ func run() error {
 	yoloF := fs.BoolP("yolo", "y", false, "run in yolo mode (execute without confirmation)")
 	humanF := fs.BoolP("human", "H", false, "start in human mode (you type the commands)")
 	whitelistF := fs.StringSlice("whitelist", nil, "regex whitelist of commands that skip confirmation (confirm mode)")
+	workdirF := fs.StringP("workdir", "C", "", "working directory the agent's tools are confined to (default: current directory)")
+	readSecretsF := fs.Bool("read-secrets", false, "allow the agent to read .env/secret files")
 	outputF := fs.StringP("output", "o", "", "write the run to this JSON file")
 	exitNowF := fs.Bool("exit-immediately", false, "don't confirm when the agent wants to finish")
 	autoQuitF := fs.Bool("auto-quit", false, "quit automatically when the run ends (benchmark mode; implies --exit-immediately)")
@@ -71,7 +75,7 @@ func run() error {
 	if cfg.APIKey == "" {
 		return errors.New("no API key configured — run `stubbs --config` or set STUBBS_API_KEY")
 	}
-	model := orDefault(*modelF, cfg.Model)
+	model := orDefault(orDefault(*modelF, cfg.ActiveModel()), config.DefaultModel)
 
 	task := strings.TrimSpace(*taskF)
 	if task == "" && fs.NArg() > 0 {
@@ -92,10 +96,30 @@ func run() error {
 	case *humanF:
 		mode = agent.ModeHuman
 	}
+	workdir := *workdirF
+	if workdir == "" {
+		if wd, err := os.Getwd(); err == nil {
+			workdir = wd
+		} else {
+			workdir = "."
+		}
+	}
+	if abs, err := filepath.Abs(workdir); err == nil {
+		workdir = abs
+	}
+
 	registry := types.NewRegistry()
-	registry.Register(tools.NewBashTool())
+	bashTool := tools.NewBashTool()
+	bashTool.Dir = workdir
+	registry.Register(bashTool)
+	readTool := tools.NewFileReadTool(workdir)
+	readTool.ReadSecrets = *readSecretsF
+	registry.Register(readTool)
+	registry.Register(tools.NewFileWriteTool(workdir))
+	registry.Register(tools.NewFileListTool(workdir))
+	registry.Register(tools.NewFileEditTool(workdir))
 	client := llm.NewORClient(cfg.APIKey, []string{model}, registry)
-	environ := env.NewLocalEnvironment(env.EnvironmentConfig{Timeout: 300}, registry)
+	environ := env.NewLocalEnvironment(env.EnvironmentConfig{WorkingDir: workdir, Timeout: 300}, registry)
 
 	iCfg := agent.InteractiveConfig{
 		AgentConfig: agent.AgentConfig{
@@ -114,6 +138,22 @@ func run() error {
 		return err
 	}
 	app.SetInterrupt(ia.Interrupt)
+	app.SetModelHandlers(func() ([]tui.ModelChoice, error) {
+		mctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		models, err := client.ListModels(mctx)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]tui.ModelChoice, len(models))
+		for i, m := range models {
+			out[i] = tui.ModelChoice{ID: m.ID, Name: m.Name}
+		}
+		return out, nil
+	}, func(id string) error {
+		ia.SetModel(id) // updates the client, the agent, the session and the header
+		return config.SaveModel(id)
+	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -178,15 +218,7 @@ func runWizard() error {
 	if err != nil {
 		return err
 	}
-	values := map[string]string{
-		"PROVIDER": newCfg.Provider,
-		"MODEL":    newCfg.Model,
-		"ENV":      newCfg.Env,
-	}
-	if newCfg.APIKey != "" {
-		values["API_KEY"] = newCfg.APIKey
-	}
-	if err := config.SaveConfig(config.ProjectConfigFile, values); err != nil {
+	if err := config.SaveConfig(newCfg); err != nil {
 		return fmt.Errorf("save config: %w", err)
 	}
 	if wasConfigured {

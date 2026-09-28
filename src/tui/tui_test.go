@@ -487,3 +487,75 @@ func TestMouseDragSelectionCopies(t *testing.T) {
 		t.Error("keypress should clear selection")
 	}
 }
+
+func TestModelsSlashCommandOpensPicker(t *testing.T) {
+	m := testModel()
+	m.app = &App{modelsFn: func() ([]ModelChoice, error) {
+		return []ModelChoice{{ID: "a/one", Name: "One"}, {ID: "b/two", Name: "Two"}}, nil
+	}}
+	reply := make(chan inputResult, 1)
+	m.pending = &pendingInput{kind: inComment, reply: reply}
+	m.ta.SetValue("/models")
+
+	cmd := m.submitPending()
+	if cmd == nil {
+		t.Fatal("/models should return a fetch command")
+	}
+	if len(reply) != 0 {
+		t.Error("/models must not resolve the pending prompt")
+	}
+	msg, ok := cmd().(modelsLoadedMsg)
+	if !ok {
+		t.Fatalf("fetch cmd produced %T, want modelsLoadedMsg", cmd())
+	}
+	m.Update(msg)
+	if m.dlg == nil || m.dlg.kind != dlgModels {
+		t.Fatalf("expected models dialog, got %+v", m.dlg)
+	}
+	if len(m.dlg.options) != 2 {
+		t.Fatalf("dialog has %d options, want 2", len(m.dlg.options))
+	}
+}
+
+func TestModelsDialogFilter(t *testing.T) {
+	d := newModelsDialog([]ModelChoice{
+		{ID: "anthropic/claude", Name: "Claude"},
+		{ID: "openai/gpt", Name: "GPT"},
+		{ID: "meta/llama", Name: ""},
+	})
+	d.filter = "cla"
+	d.applyFilter()
+	if len(d.options) != 1 || d.options[0].text != "anthropic/claude" {
+		t.Fatalf("filter 'cla' = %+v", d.options)
+	}
+	d.filter = ""
+	d.applyFilter()
+	if len(d.options) != 3 {
+		t.Fatalf("cleared filter should restore all options, got %d", len(d.options))
+	}
+}
+
+func TestModelsDialogSelectSwitches(t *testing.T) {
+	var switched string
+	m := testModel()
+	m.app = &App{switchFn: func(id string) error {
+		switched = id
+		return nil
+	}}
+	m.dlg = newModelsDialog([]ModelChoice{{ID: "a/one", Name: "One"}, {ID: "b/two", Name: "Two"}})
+	m.dlg.selected = 1
+
+	cmd := m.pickDialogOption()
+	if m.dlg != nil {
+		t.Error("picking a model should close the dialog")
+	}
+	if cmd == nil {
+		t.Fatal("picking a model should return a switch command")
+	}
+	if res, ok := cmd().(modelSwitchedMsg); !ok || res.err != nil || res.id != "b/two" {
+		t.Fatalf("switch cmd = %+v", cmd())
+	}
+	if switched != "b/two" {
+		t.Errorf("switchFn called with %q, want b/two", switched)
+	}
+}

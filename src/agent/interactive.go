@@ -73,6 +73,7 @@ type UI interface {
 	Observation(call types.ToolCall, out types.ExecutionOutput)
 	Status(text string)
 	ModeChanged(m Mode)
+	ModelChanged(model string)
 	AskConfirm(commands []string) (string, error)
 	AskCommand() (string, error)
 	AskComment() (string, error)
@@ -129,6 +130,20 @@ func (ia *InteractiveAgent) SetMode(m Mode) {
 	ia.cfg.Mode = m
 	ia.ui.ModeChanged(m)
 	ia.ui.Info("Switched to %s mode.", m)
+}
+
+// SetModel switches the active model and reports the change to the UI.
+func (ia *InteractiveAgent) SetModel(model string) {
+	if model == "" {
+		return
+	}
+	if ia.Agent.Model == model {
+		ia.ui.Info("Already using %s.", model)
+		return
+	}
+	ia.Agent.SetModel(model)
+	ia.ui.ModelChanged(model)
+	ia.ui.Info("Switched to model %s.", model)
 }
 
 func (ia *InteractiveAgent) Run(ctx context.Context, task string) (string, error) {
@@ -503,6 +518,9 @@ func (ia *InteractiveAgent) whitelisted(cmd string) bool {
 
 // CommandOf extracts the human-readable command from a tool call.
 func CommandOf(call types.ToolCall) string {
+	if s := fileCommandOf(call); s != "" {
+		return s
+	}
 	var args struct {
 		Command string `json:"command"`
 	}
@@ -510,6 +528,56 @@ func CommandOf(call types.ToolCall) string {
 		return args.Command
 	}
 	return call.Function.Arguments
+}
+
+// fileCommandOf renders a short preview for the file tools so confirmation
+// prompts and whitelist matching do not have to display raw argument JSON.
+func fileCommandOf(call types.ToolCall) string {
+	switch call.Function.Name {
+	case "file_read":
+		var a struct {
+			FilePath string `json:"file_path"`
+		}
+		if json.Unmarshal([]byte(call.Function.Arguments), &a) == nil {
+			return "read " + a.FilePath
+		}
+	case "file_write":
+		var a struct {
+			FilePath string `json:"file_path"`
+			Content  string `json:"content"`
+			Append   bool   `json:"append"`
+		}
+		if json.Unmarshal([]byte(call.Function.Arguments), &a) == nil {
+			verb := "write"
+			if a.Append {
+				verb = "append"
+			}
+			return fmt.Sprintf("%s %s (%d bytes)", verb, a.FilePath, len(a.Content))
+		}
+	case "file_edit":
+		var a struct {
+			FilePath string `json:"file_path"`
+		}
+		if json.Unmarshal([]byte(call.Function.Arguments), &a) == nil {
+			return "edit " + a.FilePath
+		}
+	case "file_list":
+		var a struct {
+			Path      string `json:"path"`
+			Recursive bool   `json:"recursive"`
+		}
+		if json.Unmarshal([]byte(call.Function.Arguments), &a) == nil {
+			p := a.Path
+			if p == "" {
+				p = "."
+			}
+			if a.Recursive {
+				return "list " + p + " (recursive)"
+			}
+			return "list " + p
+		}
+	}
+	return ""
 }
 
 func (ia *InteractiveAgent) finish(content string) (bool, error) {
@@ -565,6 +633,7 @@ func (ia *InteractiveAgent) printHelp() {
 	ia.ui.Info("/y — switch to yolo mode (execute LM commands without confirmation)")
 	ia.ui.Info("/c — switch to confirm mode (ask before executing LM commands)")
 	ia.ui.Info("/u — switch to human mode (execute commands issued by the user)")
+	ia.ui.Info("/models — browse and switch the active model")
 	ia.ui.Info("/m — expand the input box (multiline editing)")
 	ia.ui.Info("/h — show this help")
 }

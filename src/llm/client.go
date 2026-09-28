@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"stubbs/src/types"
+	"sync"
 	"time"
 )
 
@@ -18,11 +19,49 @@ const maxAttempts = 3
 
 type ORClient struct {
 	apiKey    string
+	mu        sync.RWMutex // guards models; the active model can change at runtime
 	models    []string
 	maxTokens int
 	baseURL   string
 	hc        *http.Client
 	Tools     []types.Tool
+}
+
+// SetModel switches the active model. The change takes effect on the next
+// request. Safe to call while CompleteText is in flight.
+func (c *ORClient) SetModel(model string) {
+	if c == nil || model == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.models) == 0 {
+		c.models = []string{model}
+		return
+	}
+	c.models[0] = model
+}
+
+// Model returns the active model.
+func (c *ORClient) Model() string {
+	if c == nil {
+		return ""
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.models) == 0 {
+		return ""
+	}
+	return c.models[0]
+}
+
+func (c *ORClient) activeModel() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.models) == 0 {
+		return ""
+	}
+	return c.models[0]
 }
 
 type ORChatRequest struct {
@@ -142,7 +181,7 @@ func (c *ORClient) CompleteText(ctx context.Context, messages []types.Message) (
 				return ORChatResponse{}, ctx.Err()
 			}
 		}
-		resp, err := c.query(ctx, c.models[0], messages)
+		resp, err := c.query(ctx, c.activeModel(), messages)
 		if err == nil {
 			if resp.Error != nil {
 				lastErr = fmt.Errorf("openrouter: %s (code %d)", resp.Error.Message, resp.Error.Code)

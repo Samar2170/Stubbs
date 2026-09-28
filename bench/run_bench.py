@@ -91,11 +91,58 @@ def parse_env_file(path: Path) -> dict[str, str]:
     return out
 
 
+def parse_yaml_scalars(path: Path) -> dict[str, str]:
+    """Parse the flat config.yaml. For the `models` list, keep its first (most
+    recently selected) item."""
+    out: dict[str, str] = {}
+    if not path.is_file():
+        return out
+    list_key = ""
+    for line in path.read_text().splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("- "):
+            if list_key and list_key not in out:
+                out[list_key] = stripped[2:].strip().strip('"').strip("'")
+            continue
+        if ":" not in stripped:
+            continue
+        k, v = stripped.split(":", 1)
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        if v == "":
+            list_key = k
+            continue
+        list_key = ""
+        out[k] = v
+    return out
+
+
 def load_credentials() -> tuple[str, str]:
     """Return (api_key, model) from env or the host .stubbs config."""
-    cfg = parse_env_file(REPO_ROOT / ".stubbs" / "stubbs.env")
-    api_key = os.environ.get("STUBBS_API_KEY") or os.environ.get("OPENROUTER_API_KEY") or cfg.get("API_KEY") or cfg.get("STUBBS_API_KEY") or ""
-    model = os.environ.get("STUBBS_MODEL") or cfg.get("MODEL") or cfg.get("STUBBS_MODEL") or ""
+    stubbs = REPO_ROOT / ".stubbs"
+    env_cfg = parse_env_file(stubbs / ".env")
+    legacy = parse_env_file(stubbs / "stubbs.env")
+    yaml_cfg = parse_yaml_scalars(stubbs / "config.yaml")
+    api_key = (
+        os.environ.get("STUBBS_API_KEY")
+        or os.environ.get("OPENROUTER_API_KEY")
+        or env_cfg.get("API_KEY")
+        or env_cfg.get("STUBBS_API_KEY")
+        or legacy.get("API_KEY")
+        or legacy.get("STUBBS_API_KEY")
+        or ""
+    )
+    model = (
+        os.environ.get("STUBBS_MODEL")
+        or yaml_cfg.get("models")
+        or yaml_cfg.get("model")
+        or env_cfg.get("MODEL")
+        or legacy.get("MODEL")
+        or legacy.get("STUBBS_MODEL")
+        or ""
+    )
     return api_key, model
 
 
@@ -253,10 +300,10 @@ def cmd_run(args) -> None:
     verify_stubbs(args.stubbs)
     api_key, cfg_model = load_credentials()
     if not api_key:
-        sys.exit("no API key: set STUBBS_API_KEY or configure .stubbs/stubbs.env")
+        sys.exit("no API key: set STUBBS_API_KEY or configure .stubbs/.env")
     model = args.model or cfg_model
     if not model:
-        sys.exit("no model: pass --model or set STUBBS_MODEL / .stubbs/stubbs.env")
+        sys.exit("no model: pass --model or set STUBBS_MODEL / .stubbs/config.yaml")
 
     instances_path = args.instances or (BENCH_DIR / "instances.jsonl")
     if not instances_path.is_file():

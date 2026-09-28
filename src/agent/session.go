@@ -70,6 +70,16 @@ func (s *Session) Append(msg types.Message) error {
 
 }
 
+// SetModel updates the model recorded on subsequent session entries.
+func (s *Session) SetModel(model string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.model = model
+}
+
 func (s *Session) History() []types.Message {
 	if s == nil {
 		return nil

@@ -65,7 +65,7 @@ func (w *wizard) applyStep(i int) {
 		w.input.Placeholder = "sk-or-… (enter keeps the env value)"
 	case 1:
 		w.input.Placeholder = config.DefaultModel
-		w.input.SetValue(w.cfg.Model)
+		w.input.SetValue(w.cfg.ActiveModel())
 	case 2:
 		w.input.Placeholder = "local"
 		w.input.SetValue(w.cfg.Env)
@@ -129,7 +129,7 @@ func (w wizard) valid(value string) bool {
 func (w wizard) View() string {
 	var b strings.Builder
 	b.WriteString(w.st.title.Render("stubbs") + " " + w.st.agent.Render("Welcome to stubbs!") + "\n")
-	b.WriteString(w.st.faint.Render("Configure OpenRouter access. Saved to "+config.ProjectConfigFile) + "\n\n")
+	b.WriteString(w.st.faint.Render("Configure OpenRouter access. Settings are saved to "+config.ProjectConfigFile+", secrets to "+config.ProjectEnvFile) + "\n\n")
 
 	dots := make([]string, len(w.steps))
 	for i := range w.steps {
@@ -168,7 +168,7 @@ func RunWizard(cfg config.StubbsConfig, hasKeyFromEnv bool) (config.StubbsConfig
 		out.APIKey = v
 	}
 	if v := w.values[1]; v != "" {
-		out.Model = v
+		out.SetActiveModel(v)
 	}
 	if v := w.values[2]; v != "" {
 		out.Env = v
