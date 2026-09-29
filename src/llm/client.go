@@ -169,6 +169,16 @@ func (c *ORClient) toolDefinitions() []types.ToolDefinition {
 }
 
 func (c *ORClient) CompleteText(ctx context.Context, messages []types.Message) (ORChatResponse, error) {
+	return c.complete(ctx, messages, c.toolDefinitions())
+}
+
+// Complete is like CompleteText but does not offer any tools. It is used for
+// auxiliary calls (such as memory summarization) that must return plain text.
+func (c *ORClient) Complete(ctx context.Context, messages []types.Message) (ORChatResponse, error) {
+	return c.complete(ctx, messages, nil)
+}
+
+func (c *ORClient) complete(ctx context.Context, messages []types.Message, tools []types.ToolDefinition) (ORChatResponse, error) {
 	if c == nil {
 		return ORChatResponse{}, fmt.Errorf("client is nil")
 	}
@@ -181,7 +191,7 @@ func (c *ORClient) CompleteText(ctx context.Context, messages []types.Message) (
 				return ORChatResponse{}, ctx.Err()
 			}
 		}
-		resp, err := c.query(ctx, c.activeModel(), messages)
+		resp, err := c.query(ctx, c.activeModel(), messages, tools)
 		if err == nil {
 			if resp.Error != nil {
 				lastErr = fmt.Errorf("openrouter: %s (code %d)", resp.Error.Message, resp.Error.Code)
@@ -202,10 +212,10 @@ func (c *ORClient) CompleteText(ctx context.Context, messages []types.Message) (
 	return ORChatResponse{}, fmt.Errorf("openrouter: giving up after %d attempts: %w", maxAttempts, lastErr)
 }
 
-func (c *ORClient) query(ctx context.Context, model string, messages []types.Message) (ORChatResponse, error) {
+func (c *ORClient) query(ctx context.Context, model string, messages []types.Message, tools []types.ToolDefinition) (ORChatResponse, error) {
 	var chatResp ORChatResponse
 	payload, err := json.Marshal(ORChatRequest{
-		Model: model, Messages: messages, MaxTokens: c.maxTokens, Tools: c.toolDefinitions(),
+		Model: model, Messages: messages, MaxTokens: c.maxTokens, Tools: tools,
 	})
 	if err != nil {
 		return chatResp, err

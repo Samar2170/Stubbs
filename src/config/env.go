@@ -53,6 +53,27 @@ func (a ApprovalConfig) PolicyFor(tool string) string {
 	return ApprovalConfirm
 }
 
+// MemoryConfig controls the persistent memory subsystem. BudgetTokens of 0
+// means "no cap"; recalled memory is then left to the context reducer to
+// prioritise.
+type MemoryConfig struct {
+	Enabled           bool `yaml:"enabled"`
+	AutoSummarize     bool `yaml:"auto_summarize"`
+	AutoRepoMap       bool `yaml:"auto_repo_map"`
+	CaptureHeuristics bool `yaml:"capture_heuristics"`
+	BudgetTokens      int  `yaml:"budget_tokens"`
+	TopK              int  `yaml:"top_k"`
+}
+
+func defaultMemoryConfig() MemoryConfig {
+	return MemoryConfig{
+		Enabled:       true,
+		AutoSummarize: true,
+		AutoRepoMap:   true,
+		TopK:          5,
+	}
+}
+
 // StubbsConfig is the persisted configuration. The API key lives in .env; every
 // other field lives in config.yaml.
 
@@ -62,6 +83,7 @@ type StubbsConfig struct {
 	Env      string         `yaml:"env"`
 	Theme    string         `yaml:"theme"`
 	Approval ApprovalConfig `yaml:"approval,omitempty"`
+	Memory   MemoryConfig   `yaml:"memory,omitempty"`
 	APIKey   string         `yaml:"-"`
 }
 
@@ -101,6 +123,7 @@ func defaultConfig() StubbsConfig {
 		Provider: "openrouter",
 		Env:      "local",
 		Theme:    DefaultTheme,
+		Memory:   defaultMemoryConfig(),
 	}
 }
 
@@ -119,7 +142,9 @@ func readConfigFile() StubbsConfig {
 		Env      string         `yaml:"env"`
 		Theme    string         `yaml:"theme"`
 		Approval ApprovalConfig `yaml:"approval"`
+		Memory   MemoryConfig   `yaml:"memory"`
 	}
+	fileCfg.Memory = defaultMemoryConfig()
 	if err := yaml.Unmarshal(b, &fileCfg); err != nil {
 		return cfg
 	}
@@ -127,6 +152,7 @@ func readConfigFile() StubbsConfig {
 	cfg.Env = fileCfg.Env
 	cfg.Theme = fileCfg.Theme
 	cfg.Approval = fileCfg.Approval
+	cfg.Memory = fileCfg.Memory
 	if len(fileCfg.Models) > 0 {
 		cfg.Models = fileCfg.Models
 	} else if fileCfg.Model != "" {
@@ -154,6 +180,9 @@ func fileOrDefaults() StubbsConfig {
 	}
 	if fileCfg.Approval.Default != "" || len(fileCfg.Approval.Tools) > 0 {
 		cfg.Approval = fileCfg.Approval
+	}
+	if fileCfg.Memory != (MemoryConfig{}) {
+		cfg.Memory = fileCfg.Memory
 	}
 	return cfg
 }

@@ -87,6 +87,9 @@ type modelSwitchedMsg struct {
 	id  string
 	err error
 }
+type repoMapMsg struct {
+	err error
+}
 
 const idlePlaceholder = "Type here…  (/h for help)"
 
@@ -97,6 +100,14 @@ type Options struct {
 	Mode     agent.Mode
 }
 
+// MemoryHandlers wires the /remember, /forget, /memory and /map commands.
+type MemoryHandlers struct {
+	Remember func(text string) error
+	Forget   func(query string) (int, error)
+	List     func() ([]string, error)
+	Map      func() error
+}
+
 // App implements agent.UI on top of a full-screen Bubble Tea program.
 // Ask* methods block on a reply channel that the Update loop resolves.
 type App struct {
@@ -104,6 +115,7 @@ type App struct {
 	interrupt func()
 	modelsFn  func() ([]ModelChoice, error)
 	switchFn  func(id string) error
+	memory    *MemoryHandlers
 	autoQuit  bool
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -134,6 +146,10 @@ func (a *App) SetModelHandlers(fetch func() ([]ModelChoice, error), switchTo fun
 	a.modelsFn = fetch
 	a.switchFn = switchTo
 }
+
+// SetMemoryHandlers wires the callbacks used by the /remember, /forget and
+// /memory commands.
+func (a *App) SetMemoryHandlers(h MemoryHandlers) { a.memory = &h }
 
 // Run runs the TUI until the user quits. When it returns, any prompt that is
 // still waiting for an answer is released so the agent goroutine can stop.
@@ -415,6 +431,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.statusErr = false
 		m.status = "model: " + msg.id
+		return m, nil
+
+	case repoMapMsg:
+		m.working = false
+		if msg.err != nil {
+			m.statusErr = true
+			m.status = "repo map failed: " + msg.err.Error()
+			return m, nil
+		}
+		m.statusErr = false
+		m.status = "repository map updated"
 		return m, nil
 
 	case inputReqMsg:
@@ -735,6 +762,97 @@ func (m *model) loadModels() tea.Cmd {
 	}
 }
 
+func (m *model) generateRepoMap() tea.Cmd {
+	app := m.app
+	return func() tea.Msg {
+		if app == nil || app.memory == nil || app.memory.Map == nil {
+			return repoMapMsg{err: errors.New("repo map is not wired up")}
+		}
+		return repoMapMsg{err: app.memory.Map()}
+	}
+}
+
+func (m *model) memoryCommand(text string) (tea.Cmd, bool) {
+	if m.app == nil || m.app.memory == nil {
+		return nil, false
+	}
+	h := m.app.memory
+	switch {
+	case text == "/map":
+		if h.Map == nil {
+			m.statusErr = true
+			m.status = "repo map is not wired up"
+			return nil, true
+		}
+		m.statusErr = false
+		m.working = true
+		m.status = "generating repository map…"
+		m.layout()
+		return m.generateRepoMap(), true
+	case text == "/memory":
+		if h.List == nil {
+			m.statusErr = true
+			m.status = "memory is not wired up"
+			return nil, true
+		}
+		items, err := h.List()
+		if err != nil {
+			m.statusErr = true
+			m.status = "memory: " + err.Error()
+			return nil, true
+		}
+		m.statusErr = false
+		if len(items) == 0 {
+			m.status = "memory is empty"
+		} else {
+			m.status = fmt.Sprintf("%d memories: %s", len(items), strings.Join(items, "; "))
+		}
+		return nil, true
+	case strings.HasPrefix(text, "/remember"):
+		body := strings.TrimSpace(strings.TrimPrefix(text, "/remember"))
+		if body == "" {
+			m.statusErr = true
+			m.status = "usage: /remember <text>"
+			return nil, true
+		}
+		if h.Remember == nil {
+			m.statusErr = true
+			m.status = "memory is not wired up"
+			return nil, true
+		}
+		if err := h.Remember(body); err != nil {
+			m.statusErr = true
+			m.status = "memory: " + err.Error()
+			return nil, true
+		}
+		m.statusErr = false
+		m.status = "remembered"
+		return nil, true
+	case strings.HasPrefix(text, "/forget"):
+		query := strings.TrimSpace(strings.TrimPrefix(text, "/forget"))
+		if query == "" {
+			m.statusErr = true
+			m.status = "usage: /forget <id or query>"
+			return nil, true
+		}
+		if h.Forget == nil {
+			m.statusErr = true
+			m.status = "memory is not wired up"
+			return nil, true
+		}
+		n, err := h.Forget(query)
+		if err != nil {
+			m.statusErr = true
+			m.status = "memory: " + err.Error()
+			return nil, true
+		}
+		m.statusErr = false
+		m.status = fmt.Sprintf("forgot %d memory entries", n)
+		return nil, true
+	}
+	return nil, false
+}
+
 // swapComposer turns the active dialog into a composer prompt that answers
 // the same pending request.
 func (m *model) swapComposer(kind inputKind, title string, placeholder string) {
@@ -804,6 +922,11 @@ func (m *model) submitPending() tea.Cmd {
 		m.statusErr = false
 		m.status = "loading models…"
 		return m.loadModels()
+	}
+	// TUI-side memory commands never reach the agent.
+	if cmd, handled := m.memoryCommand(strings.TrimSpace(text)); handled {
+		m.ta.Reset()
+		return cmd
 	}
 	// Echo conversation messages into the transcript so the user can see
 	// (and select) their own input. Commands in human mode are rendered by

@@ -159,6 +159,9 @@ func (ia *InteractiveAgent) Run(ctx context.Context, task string) (string, error
 	if err := a.appendMessage(types.Message{Role: types.RoleUser, Content: task}); err != nil {
 		return "", err
 	}
+	a.ensureRepoMap(ctx)
+	a.injectMemory(task)
+	defer a.summarizeMemory(ctx)
 	for {
 		if err := ctx.Err(); err != nil {
 			return "", err

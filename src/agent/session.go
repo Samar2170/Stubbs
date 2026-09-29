@@ -82,6 +82,15 @@ func (s *Session) ContextMessages(budget int) []types.Message {
 	return s.context.Build(budget)
 }
 
+func (s *Session) InjectMemory(content string, importance float32) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.context.AddMemory(content, importance)
+}
+
 // SetModel updates the model recorded on subsequent session entries.
 func (s *Session) SetModel(model string) {
 	if s == nil {

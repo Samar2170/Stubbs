@@ -33,11 +33,11 @@ type ContextItem struct {
 |------|---------|--------|--------|
 | `System` | system prompt | 0 | yes |
 | `Task` | the original user task | 0 | yes |
-| `Memory` | reserved for summaries (phase 3) | 2 | yes |
+| `Memory` | recalled persistent memory | 2 | no |
 | `Plan` | reserved for the agent's plan | 2 | yes |
 | `RecentHistory` | normal user/assistant turns | 1 | no |
 | `ToolResults` | tool observations | 0.5 | no |
-| `Buffer` | reserved headroom (phase 2) | 0 | no |
+| `Buffer` | reserved headroom (later phase) | 0 | no |
 
 ## Algorithm
 
@@ -53,8 +53,7 @@ type ContextItem struct {
 3. **Budget check.** `reduce` returns immediately unless the summed tokens
    exceed `budget`.
 4. **Protect.** The last `minRecentTurns` (4) turns are always kept, as are any
-   turns containing a pinned item (`Pinned`, `System`, `Task`, `Memory`,
-   `Plan`).
+   turns containing a pinned item (`Pinned`, `System`, `Task`, `Plan`).
 5. **Score candidates.** Remaining turns are scored by `turnScore`:
    `max(recency, typeWeight + Importance − refetchPenalty)` over their items.
    Recency is `(rank+1)/totalTurns`, so newer turns score higher; type weight
@@ -78,6 +77,9 @@ does not come back during this run.
   phase.
 - `(*Context) AddMessage(msg)` — appends a message, inferring its `Type` and
   `Pinned` from role. First user message becomes `Task`.
+- `(*Context) AddMemory(content, importance)` — inserts an evictable `Memory`
+  item directly after the system prompt. Never pinned, but weighted higher than
+  history by `typeWeight`.
 - `(*Context) addTask(task)` — explicitly pins a task item with ID `"task"`.
 - `(*Context) hasType(t)` — reports whether any item already has type `t`
   (used to make the first user message the task).
@@ -100,6 +102,12 @@ locks and calls `Build`. `Agent.getMessages` returns
 history, while `Session.History()` still exposes the full log (used for the
 trajectory artifact in `cmd/stubbs/main.go`).
 
+At the start of a run, `Agent.injectMemory(task)` builds a memory preamble from
+`memory.Store` (core files plus `Search(task, TopK)`) and installs it through
+`Session.InjectMemory`. The preamble is rendered by `memoryPreamble`, which
+honours `MemoryConfig.BudgetTokens` (0 means no cap) and is injected only into
+the context window, not the durable session log.
+
 ## Budget
 
 `MODEL_LIMIT = 1000000` and `contextBudget = MODEL_LIMIT * 1 / 2` (500k
@@ -110,7 +118,10 @@ window.
 
 - No summarization yet: evicted turns are gone, not compressed.
 - `Importance` and `Refetchable` are honored by the scorer but not populated
-  by callers yet.
+  by callers yet (memory sets `Importance`).
 - No refetch of dropped tool results.
 - Single global budget, not per-model.
 - `estimateTokens` is approximate.
+- Memory is recalled by keyword (`memory.Store.Search`); no embeddings.
+- The repository map is generated on first run (or via `--map` / `/map`) and
+  injected as part of the memory preamble.

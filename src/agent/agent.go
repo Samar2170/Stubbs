@@ -6,6 +6,7 @@ import (
 	"strings"
 	"stubbs/src/env"
 	"stubbs/src/llm"
+	"stubbs/src/memory"
 	"stubbs/src/types"
 	"time"
 )
@@ -16,6 +17,8 @@ type AgentConfig struct {
 	StepLimit     int
 	CostLimit     float32
 	WallTimeLimit int
+	WorkingDir    string
+	Memory        *memory.Store
 }
 
 type Agent struct {
@@ -29,6 +32,8 @@ type Agent struct {
 	ModelCalls  int
 	Environment env.Environment
 	Session     *Session
+	Memory      *memory.Store
+	WorkingDir  string
 }
 
 func NewAgent(cfg *AgentConfig, client llm.ModelClient, environ env.Environment, model string, contextEnabled bool) (*Agent, error) {
@@ -49,6 +54,8 @@ func NewAgent(cfg *AgentConfig, client llm.ModelClient, environ env.Environment,
 		Environment: environ,
 		StartTime:   time.Now(),
 		Session:     s,
+		Memory:      cfg.Memory,
+		WorkingDir:  cfg.WorkingDir,
 	}, nil
 }
 
@@ -62,6 +69,9 @@ func (a *Agent) Run(ctx context.Context, task string) (string, error) {
 	if err := a.appendMessage(types.Message{Role: "user", Content: task}); err != nil {
 		return "", err
 	}
+	a.ensureRepoMap(ctx)
+	a.injectMemory(task)
+	defer a.summarizeMemory(ctx)
 	var resp string
 	for a.Steps < a.config.StepLimit && (a.config.CostLimit <= 0 || a.Cost <= a.config.CostLimit) {
 		content, err := a.step(ctx)
@@ -114,6 +124,65 @@ func (a *Agent) getMessages() []types.Message {
 	return a.Session.ContextMessages(contextBudget)
 }
 
+func (a *Agent) injectMemory(task string) {
+	if a.Memory == nil || a.Session == nil {
+		return
+	}
+	text := a.memoryPreamble(task)
+	if text == "" {
+		return
+	}
+	a.Session.InjectMemory(text, 1)
+}
+
+func (a *Agent) memoryPreamble(task string) string {
+	if a.Memory == nil {
+		return ""
+	}
+	opts := a.Memory.Options()
+	budget := opts.BudgetTokens
+	var sections []string
+	total := 0
+	add := func(text string) {
+		tokens := estimateTokens(text)
+		if budget > 0 && total+tokens > budget {
+			return
+		}
+		sections = append(sections, text)
+		total += tokens
+	}
+
+	core, err := a.Memory.Core()
+	if err == nil {
+		for _, e := range core {
+			if strings.TrimSpace(e.Body) == "" {
+				continue
+			}
+			add(fmt.Sprintf("## %s\n%s", e.Title, e.Body))
+		}
+	}
+
+	if repoMap, err := a.Memory.RepoMap(); err == nil && repoMap != "" {
+		add("## Repository map\n" + repoMap)
+	}
+
+	topK := opts.TopK
+	if topK <= 0 {
+		topK = 5
+	}
+	if relevant, err := a.Memory.Search(task, topK); err == nil {
+		for _, e := range relevant {
+			add(fmt.Sprintf("- [%s] %s: %s", e.Kind, e.Title, e.Body))
+		}
+	}
+
+	if len(sections) == 0 {
+		return ""
+	}
+	return "Persistent project memory (may be stale; verify against the repository):\n\n" +
+		strings.Join(sections, "\n\n")
+}
+
 func (a *Agent) respond(ctx context.Context) (types.Message, error) {
 	a.Steps++
 	resp, err := a.query(ctx)
@@ -139,6 +208,7 @@ func (a *Agent) executeRuns(ctx context.Context, calls []types.ToolCall) ([]type
 	outputs := make([]types.ExecutionOutput, 0, len(calls))
 	for _, call := range calls {
 		out := a.Environment.Execute(ctx, call)
+		a.captureHeuristic(call, out)
 		outputs = append(outputs, out)
 		if err := a.appendMessage(types.Message{
 			Role:       types.RoleTool,

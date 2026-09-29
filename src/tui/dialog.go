@@ -135,6 +135,10 @@ func (d *dialog) render(width int, s styles) string {
 			[2]string{"/h", "this help"},
 			[2]string{"/u /c /y", "human · confirm · yolo mode"},
 			[2]string{"/models", "switch model"},
+			[2]string{"/remember", "save a memory"},
+			[2]string{"/forget", "delete memories"},
+			[2]string{"/memory", "list memories"},
+			[2]string{"/map", "regenerate repo map"},
 			[2]string{"/m", "expand input box"},
 			[2]string{"q", "end run (limits prompt)"},
 		)...)

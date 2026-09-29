@@ -91,6 +91,27 @@ func (c *Context) AddMessage(msg types.Message) {
 
 }
 
+func (c *Context) AddMemory(content string, importance float32) {
+	if c == nil || strings.TrimSpace(content) == "" {
+		return
+	}
+	item := ContextItem{
+		Message:    types.Message{Role: types.RoleSystem, Content: content},
+		ID:         fmt.Sprintf("memory-%d", len(c.Items)),
+		Tokens:     estimateTokens(content),
+		Importance: importance,
+		Timestamp:  time.Now(),
+		Type:       Memory,
+	}
+	pos := 1
+	if pos > len(c.Items) {
+		pos = len(c.Items)
+	}
+	c.Items = append(c.Items, ContextItem{})
+	copy(c.Items[pos+1:], c.Items[pos:])
+	c.Items[pos] = item
+}
+
 func (c *Context) addTask(task string) {
 	c.Items = append(c.Items, ContextItem{
 		ID:        "task",
@@ -158,7 +179,7 @@ func turnPinned(items []ContextItem, t turn) bool {
 			return true
 		}
 		switch items[i].Type {
-		case System, Task, Memory, Plan:
+		case System, Task, Plan:
 			return true
 		}
 	}
