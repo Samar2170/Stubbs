@@ -258,7 +258,7 @@ func writeRun(path string, a *agent.InteractiveAgent, submission string, runErr 
 		ModelCalls:       a.ModelCalls,
 		Cost:             a.Cost,
 		Submission:       submission,
-		Messages:         a.Messages,
+		Messages:         a.Session.History(),
 	}
 	if runErr != nil {
 		doc.Error = runErr.Error()

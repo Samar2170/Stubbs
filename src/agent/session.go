@@ -15,6 +15,7 @@ import (
 type Session struct {
 	Id        uint
 	Messages  []types.Message
+	context   Context
 	CreatedAt time.Time
 	mu        sync.Mutex
 	model     string
@@ -41,6 +42,7 @@ func newSession(model string, systemMsg string) (*Session, error) {
 		},
 		CreatedAt: time.Now(),
 		model:     model,
+		context:   NewContext(systemMsg),
 	}
 	f, err := os.OpenFile(filepath.Join(config.SessionsDir, fmt.Sprintf("session_%d.jsonl", session.Id)), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
@@ -57,6 +59,7 @@ func (s *Session) Append(msg types.Message) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Messages = append(s.Messages, msg)
+	s.context.AddMessage(msg)
 	rec := sessionRecord{Timestamp: time.Now(), Type: msg.Role, Content: msg.Content, ToolCallID: msg.ToolCallID, Model: s.model}
 	line, err := json.Marshal(rec)
 	if err != nil {
@@ -68,6 +71,15 @@ func (s *Session) Append(msg types.Message) error {
 	}
 	return s.w.Sync()
 
+}
+
+func (s *Session) ContextMessages(budget int) []types.Message {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.context.Build(budget)
 }
 
 // SetModel updates the model recorded on subsequent session entries.

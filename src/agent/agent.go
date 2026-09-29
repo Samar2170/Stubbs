@@ -27,7 +27,6 @@ type Agent struct {
 	Cost        float32
 	Steps       int
 	ModelCalls  int
-	Messages    []types.Message
 	Environment env.Environment
 	Session     *Session
 }
@@ -50,7 +49,6 @@ func NewAgent(cfg *AgentConfig, client llm.ModelClient, environ env.Environment,
 		Environment: environ,
 		StartTime:   time.Now(),
 		Session:     s,
-		Messages:    []types.Message{{Role: types.RoleSystem, Content: SYSTEM_TEMPLATE}},
 	}, nil
 }
 
@@ -97,7 +95,6 @@ func (a *Agent) appendMessage(msg types.Message) error {
 	if err := a.Session.Append(msg); err != nil {
 		return fmt.Errorf("append to session: %w", err)
 	}
-	a.Messages = append(a.Messages, msg)
 	return nil
 }
 
@@ -114,7 +111,7 @@ func (a *Agent) query(ctx context.Context) (llm.ORChatResponse, error) {
 }
 
 func (a *Agent) getMessages() []types.Message {
-	return a.Messages
+	return a.Session.ContextMessages(contextBudget)
 }
 
 func (a *Agent) respond(ctx context.Context) (types.Message, error) {
