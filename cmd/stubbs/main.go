@@ -14,6 +14,7 @@ import (
 	"stubbs/src/config"
 	"stubbs/src/env"
 	"stubbs/src/llm"
+	"stubbs/src/memory"
 	"stubbs/src/tools"
 	"stubbs/src/tui"
 	"stubbs/src/types"
@@ -53,6 +54,7 @@ func run() error {
 	exitNowF := fs.Bool("exit-immediately", false, "don't confirm when the agent wants to finish")
 	autoQuitF := fs.Bool("auto-quit", false, "quit automatically when the run ends (benchmark mode; implies --exit-immediately)")
 	configWizF := fs.Bool("config", false, "run the configuration wizard and exit")
+	mapF := fs.Bool("map", false, "regenerate the repository memory map and exit")
 	versionF := fs.Bool("version", false, "print version and exit")
 	fs.Parse(os.Args[1:])
 
@@ -108,6 +110,22 @@ func run() error {
 		workdir = abs
 	}
 
+	var memStore *memory.Store
+	if cfg.Memory.Enabled {
+		store, err := memory.NewStore(memory.Options{
+			Dir:               config.MemoryDir,
+			BudgetTokens:      cfg.Memory.BudgetTokens,
+			TopK:              cfg.Memory.TopK,
+			AutoSummarize:     cfg.Memory.AutoSummarize,
+			AutoRepoMap:       cfg.Memory.AutoRepoMap,
+			CaptureHeuristics: cfg.Memory.CaptureHeuristics,
+		})
+		if err != nil {
+			return err
+		}
+		memStore = store
+	}
+
 	registry := types.NewRegistry()
 	bashTool := tools.NewBashTool()
 	bashTool.Dir = workdir
@@ -118,16 +136,23 @@ func run() error {
 	registry.Register(tools.NewFileWriteTool(workdir))
 	registry.Register(tools.NewFileListTool(workdir))
 	registry.Register(tools.NewFileEditTool(workdir))
+	registry.Register(tools.NewWebFetchTool())
+	if memStore != nil {
+		registry.Register(tools.NewMemoryTool(memStore))
+	}
 	client := llm.NewORClient(cfg.APIKey, []string{model}, registry)
 	environ := env.NewLocalEnvironment(env.EnvironmentConfig{WorkingDir: workdir, Timeout: 300}, registry)
 
 	iCfg := agent.InteractiveConfig{
 		AgentConfig: agent.AgentConfig{
-			StepLimit: *stepsF,
-			CostLimit: float32(*costF),
+			StepLimit:  *stepsF,
+			CostLimit:  float32(*costF),
+			WorkingDir: workdir,
+			Memory:     memStore,
 		},
 		Mode:             mode,
 		WhitelistActions: *whitelistF,
+		Approval:         cfg.Approval.Tools,
 		ConfirmExit:      mode == agent.ModeConfirm && !*exitNowF,
 		AutoQuit:         *autoQuitF,
 	}
@@ -154,6 +179,70 @@ func run() error {
 		ia.SetModel(id) // updates the client, the agent, the session and the header
 		return config.SaveModel(id)
 	})
+	if memStore != nil {
+		app.SetMemoryHandlers(tui.MemoryHandlers{
+			Remember: func(text string) error {
+				title := strings.TrimSpace(text)
+				if len(title) > 60 {
+					title = title[:60]
+				}
+				return memStore.Add(memory.Entry{
+					Kind:       memory.KindPreference,
+					Title:      title,
+					Body:       text,
+					Importance: 0.8,
+					Source:     "user",
+				})
+			},
+			Forget: func(query string) (int, error) {
+				entries, err := memStore.Load()
+				if err != nil {
+					return 0, err
+				}
+				q := strings.ToLower(query)
+				n := 0
+				for _, e := range entries {
+					if e.ID == query || strings.Contains(strings.ToLower(e.Title+" "+e.Body), q) {
+						if err := memStore.Delete(e.ID); err != nil {
+							return n, err
+						}
+						n++
+					}
+				}
+				return n, nil
+			},
+			List: func() ([]string, error) {
+				entries, err := memStore.Load()
+				if err != nil {
+					return nil, err
+				}
+				out := make([]string, 0, len(entries))
+				for _, e := range entries {
+					out = append(out, fmt.Sprintf("%s (%s)", e.Title, e.ID))
+				}
+				return out, nil
+			},
+			Map: func() error {
+				mctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+				defer cancel()
+				_, err := ia.GenerateRepoMap(mctx)
+				return err
+			},
+		})
+	}
+
+	if *mapF {
+		if memStore == nil {
+			return errors.New("memory is disabled; cannot generate a repository map")
+		}
+		mctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer cancel()
+		if _, err := ia.GenerateRepoMap(mctx); err != nil {
+			return err
+		}
+		fmt.Println("Wrote repository map to", filepath.Join(config.MemoryDir, "repo-map.md"))
+		return nil
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -256,7 +345,7 @@ func writeRun(path string, a *agent.InteractiveAgent, submission string, runErr 
 		ModelCalls:       a.ModelCalls,
 		Cost:             a.Cost,
 		Submission:       submission,
-		Messages:         a.Messages,
+		Messages:         a.Session.History(),
 	}
 	if runErr != nil {
 		doc.Error = runErr.Error()

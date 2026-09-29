@@ -2,6 +2,7 @@ package agent
 
 import (
 	"errors"
+	"regexp"
 	"testing"
 
 	"stubbs/src/types"
@@ -9,19 +10,25 @@ import (
 
 type stubUI struct {
 	askNewLimits func(curSteps, stepLimit int, curCost, costLimit float32) (steps int, cost float32, ok bool, err error)
+	askConfirm   func(commands []string) (string, error)
 }
 
 func (s *stubUI) Info(format string, args ...any)                     {}
 func (s *stubUI) Assistant(step int, cost float32, msg types.Message) {}
 func (s *stubUI) Observation(call types.ToolCall, out types.ExecutionOutput) {
 }
-func (s *stubUI) Status(text string)                           {}
-func (s *stubUI) ModeChanged(m Mode)                           {}
-func (s *stubUI) ModelChanged(model string)                    {}
-func (s *stubUI) AskConfirm(commands []string) (string, error) { return "", nil }
-func (s *stubUI) AskCommand() (string, error)                  { return "", nil }
-func (s *stubUI) AskComment() (string, error)                  { return "", nil }
-func (s *stubUI) AskExit() (string, error)                     { return "", nil }
+func (s *stubUI) Status(text string)        {}
+func (s *stubUI) ModeChanged(m Mode)        {}
+func (s *stubUI) ModelChanged(model string) {}
+func (s *stubUI) AskConfirm(commands []string) (string, error) {
+	if s.askConfirm != nil {
+		return s.askConfirm(commands)
+	}
+	return "", nil
+}
+func (s *stubUI) AskCommand() (string, error) { return "", nil }
+func (s *stubUI) AskComment() (string, error) { return "", nil }
+func (s *stubUI) AskExit() (string, error)    { return "", nil }
 func (s *stubUI) AskNewLimits(curSteps, stepLimit int, curCost, costLimit float32) (int, float32, bool, error) {
 	if s.askNewLimits != nil {
 		return s.askNewLimits(curSteps, stepLimit, curCost, costLimit)
@@ -80,6 +87,11 @@ func TestCommandOfFileTools(t *testing.T) {
 			want: "ls -la",
 		},
 		{
+			name: "web_fetch",
+			call: types.ToolCall{Function: types.FunctionCall{Name: "web_fetch", Arguments: `{"url":"https://example.com"}`}},
+			want: "fetch https://example.com",
+		},
+		{
 			name: "unknown falls back to raw",
 			call: types.ToolCall{Function: types.FunctionCall{Name: "mystery", Arguments: `{"x":1}`}},
 			want: `{"x":1}`,
@@ -89,6 +101,87 @@ func TestCommandOfFileTools(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := CommandOf(tc.call); got != tc.want {
 				t.Fatalf("CommandOf = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestConfirmCallsRespectsApproval(t *testing.T) {
+	bashCall := types.ToolCall{Function: types.FunctionCall{Name: "bash", Arguments: `{"command":"ls"}`}}
+	readCall := types.ToolCall{Function: types.FunctionCall{Name: "file_read", Arguments: `{"file_path":"a.go"}`}}
+
+	cases := []struct {
+		name        string
+		mode        Mode
+		approval    map[string]string
+		whitelist   []string
+		calls       []types.ToolCall
+		wantConfirm bool
+	}{
+		{
+			name:        "approved tool skips prompt",
+			mode:        ModeConfirm,
+			approval:    map[string]string{"file_read": "allow"},
+			calls:       []types.ToolCall{readCall},
+			wantConfirm: false,
+		},
+		{
+			name:        "unlisted tool prompts",
+			mode:        ModeConfirm,
+			approval:    map[string]string{"file_read": "allow"},
+			calls:       []types.ToolCall{bashCall},
+			wantConfirm: true,
+		},
+		{
+			name:        "explicit confirm prompts",
+			mode:        ModeConfirm,
+			approval:    map[string]string{"bash": "confirm"},
+			calls:       []types.ToolCall{bashCall},
+			wantConfirm: true,
+		},
+		{
+			name:        "yolo skips all",
+			mode:        ModeYolo,
+			calls:       []types.ToolCall{bashCall},
+			wantConfirm: false,
+		},
+		{
+			name:        "whitelist still skips prompt",
+			mode:        ModeConfirm,
+			whitelist:   []string{`^ls`},
+			calls:       []types.ToolCall{bashCall},
+			wantConfirm: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			asked := false
+			ui := &stubUI{askConfirm: func(commands []string) (string, error) {
+				asked = true
+				return "", nil
+			}}
+			ia := &InteractiveAgent{
+				cfg: InteractiveConfig{Mode: tc.mode, Approval: tc.approval},
+				ui:  ui,
+			}
+			ia.Agent = &Agent{config: &ia.cfg.AgentConfig}
+			for _, pattern := range tc.whitelist {
+				re, err := regexp.Compile(pattern)
+				if err != nil {
+					t.Fatal(err)
+				}
+				ia.whitelist = append(ia.whitelist, re)
+			}
+
+			approved, err := ia.confirmCalls(tc.calls)
+			if err != nil {
+				t.Fatalf("confirmCalls: %v", err)
+			}
+			if !approved {
+				t.Fatal("expected calls to be approved")
+			}
+			if asked != tc.wantConfirm {
+				t.Fatalf("AskConfirm called = %v, want %v", asked, tc.wantConfirm)
 			}
 		})
 	}

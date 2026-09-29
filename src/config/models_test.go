@@ -54,3 +54,27 @@ func TestLegacyScalarModelMigrates(t *testing.T) {
 		t.Fatalf("after migrating legacy model = %v", got)
 	}
 }
+
+func TestApprovalPreservedAcrossSaveModel(t *testing.T) {
+	isolate(t)
+
+	yaml := "provider: openrouter\nenv: local\ntheme: tokyo\napproval:\n  default: confirm\n  tools:\n    file_read: allow\n    file_list: allow\n"
+	if err := os.WriteFile(ProjectConfigFile, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := Load().Approval.PolicyFor("file_read"); got != ApprovalAllow {
+		t.Fatalf("file_read policy = %q, want %q", got, ApprovalAllow)
+	}
+
+	if err := SaveModel("someone/model"); err != nil {
+		t.Fatal(err)
+	}
+
+	got := Load().Approval
+	if got.PolicyFor("file_read") != ApprovalAllow || got.PolicyFor("file_list") != ApprovalAllow {
+		t.Fatalf("approval lost after SaveModel: %+v", got)
+	}
+	if got.PolicyFor("bash") != ApprovalConfirm {
+		t.Fatalf("unlisted bash policy = %q, want %q", got.PolicyFor("bash"), ApprovalConfirm)
+	}
+}

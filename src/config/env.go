@@ -29,14 +29,62 @@ func legacyConfigPath() string {
 	return filepath.Join(ProjectDir, "stubbs.env")
 }
 
+// ApprovalConfig controls which tools may run without confirmation. Every tool
+// requires confirmation unless it is explicitly allowed; yolo mode bypasses
+// this policy entirely. Policies are "allow" or "confirm".
+type ApprovalConfig struct {
+	Default string            `yaml:"default,omitempty"`
+	Tools   map[string]string `yaml:"tools,omitempty"`
+}
+
+const (
+	ApprovalAllow   = "allow"
+	ApprovalConfirm = "confirm"
+)
+
+// PolicyFor returns the approval policy for a tool, defaulting to confirm for
+// unlisted tools and unknown values.
+func (a ApprovalConfig) PolicyFor(tool string) string {
+	if p, ok := a.Tools[tool]; ok {
+		if p == ApprovalAllow {
+			return ApprovalAllow
+		}
+	}
+	return ApprovalConfirm
+}
+
+// MemoryConfig controls the persistent memory subsystem. BudgetTokens of 0
+// means "no cap"; recalled memory is then left to the context reducer to
+// prioritise.
+type MemoryConfig struct {
+	Enabled           bool `yaml:"enabled"`
+	AutoSummarize     bool `yaml:"auto_summarize"`
+	AutoRepoMap       bool `yaml:"auto_repo_map"`
+	CaptureHeuristics bool `yaml:"capture_heuristics"`
+	BudgetTokens      int  `yaml:"budget_tokens"`
+	TopK              int  `yaml:"top_k"`
+}
+
+func defaultMemoryConfig() MemoryConfig {
+	return MemoryConfig{
+		Enabled:       true,
+		AutoSummarize: true,
+		AutoRepoMap:   true,
+		TopK:          5,
+	}
+}
+
 // StubbsConfig is the persisted configuration. The API key lives in .env; every
 // other field lives in config.yaml.
+
 type StubbsConfig struct {
-	Provider string   `yaml:"provider"`
-	Models   []string `yaml:"models,omitempty"`
-	Env      string   `yaml:"env"`
-	Theme    string   `yaml:"theme"`
-	APIKey   string   `yaml:"-"`
+	Provider string         `yaml:"provider"`
+	Models   []string       `yaml:"models,omitempty"`
+	Env      string         `yaml:"env"`
+	Theme    string         `yaml:"theme"`
+	Approval ApprovalConfig `yaml:"approval,omitempty"`
+	Memory   MemoryConfig   `yaml:"memory,omitempty"`
+	APIKey   string         `yaml:"-"`
 }
 
 // ActiveModel returns the most recently selected model, falling back to the
@@ -75,6 +123,7 @@ func defaultConfig() StubbsConfig {
 		Provider: "openrouter",
 		Env:      "local",
 		Theme:    DefaultTheme,
+		Memory:   defaultMemoryConfig(),
 	}
 }
 
@@ -87,18 +136,23 @@ func readConfigFile() StubbsConfig {
 		return cfg
 	}
 	var fileCfg struct {
-		Provider string   `yaml:"provider"`
-		Model    string   `yaml:"model"` // legacy scalar
-		Models   []string `yaml:"models"`
-		Env      string   `yaml:"env"`
-		Theme    string   `yaml:"theme"`
+		Provider string         `yaml:"provider"`
+		Model    string         `yaml:"model"` // legacy scalar
+		Models   []string       `yaml:"models"`
+		Env      string         `yaml:"env"`
+		Theme    string         `yaml:"theme"`
+		Approval ApprovalConfig `yaml:"approval"`
+		Memory   MemoryConfig   `yaml:"memory"`
 	}
+	fileCfg.Memory = defaultMemoryConfig()
 	if err := yaml.Unmarshal(b, &fileCfg); err != nil {
 		return cfg
 	}
 	cfg.Provider = fileCfg.Provider
 	cfg.Env = fileCfg.Env
 	cfg.Theme = fileCfg.Theme
+	cfg.Approval = fileCfg.Approval
+	cfg.Memory = fileCfg.Memory
 	if len(fileCfg.Models) > 0 {
 		cfg.Models = fileCfg.Models
 	} else if fileCfg.Model != "" {
@@ -123,6 +177,12 @@ func fileOrDefaults() StubbsConfig {
 	}
 	if fileCfg.Theme != "" {
 		cfg.Theme = fileCfg.Theme
+	}
+	if fileCfg.Approval.Default != "" || len(fileCfg.Approval.Tools) > 0 {
+		cfg.Approval = fileCfg.Approval
+	}
+	if fileCfg.Memory != (MemoryConfig{}) {
+		cfg.Memory = fileCfg.Memory
 	}
 	return cfg
 }
@@ -237,7 +297,8 @@ func migrateLegacy() {
 
 func configFileHasSettings() bool {
 	c := readConfigFile()
-	return c.Provider != "" || len(c.Models) > 0 || c.Env != "" || c.Theme != ""
+	return c.Provider != "" || len(c.Models) > 0 || c.Env != "" || c.Theme != "" ||
+		c.Approval.Default != "" || len(c.Approval.Tools) > 0
 }
 
 func writeYAML(path string, cfg StubbsConfig) error {
