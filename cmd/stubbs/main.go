@@ -118,6 +118,7 @@ func run() error {
 	registry.Register(tools.NewFileWriteTool(workdir))
 	registry.Register(tools.NewFileListTool(workdir))
 	registry.Register(tools.NewFileEditTool(workdir))
+	registry.Register(tools.NewWebFetchTool())
 	client := llm.NewORClient(cfg.APIKey, []string{model}, registry)
 	environ := env.NewLocalEnvironment(env.EnvironmentConfig{WorkingDir: workdir, Timeout: 300}, registry)
 
@@ -128,6 +129,7 @@ func run() error {
 		},
 		Mode:             mode,
 		WhitelistActions: *whitelistF,
+		Approval:         cfg.Approval.Tools,
 		ConfirmExit:      mode == agent.ModeConfirm && !*exitNowF,
 		AutoQuit:         *autoQuitF,
 	}

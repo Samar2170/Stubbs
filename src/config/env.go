@@ -29,14 +29,40 @@ func legacyConfigPath() string {
 	return filepath.Join(ProjectDir, "stubbs.env")
 }
 
+// ApprovalConfig controls which tools may run without confirmation. Every tool
+// requires confirmation unless it is explicitly allowed; yolo mode bypasses
+// this policy entirely. Policies are "allow" or "confirm".
+type ApprovalConfig struct {
+	Default string            `yaml:"default,omitempty"`
+	Tools   map[string]string `yaml:"tools,omitempty"`
+}
+
+const (
+	ApprovalAllow   = "allow"
+	ApprovalConfirm = "confirm"
+)
+
+// PolicyFor returns the approval policy for a tool, defaulting to confirm for
+// unlisted tools and unknown values.
+func (a ApprovalConfig) PolicyFor(tool string) string {
+	if p, ok := a.Tools[tool]; ok {
+		if p == ApprovalAllow {
+			return ApprovalAllow
+		}
+	}
+	return ApprovalConfirm
+}
+
 // StubbsConfig is the persisted configuration. The API key lives in .env; every
 // other field lives in config.yaml.
+
 type StubbsConfig struct {
-	Provider string   `yaml:"provider"`
-	Models   []string `yaml:"models,omitempty"`
-	Env      string   `yaml:"env"`
-	Theme    string   `yaml:"theme"`
-	APIKey   string   `yaml:"-"`
+	Provider string         `yaml:"provider"`
+	Models   []string       `yaml:"models,omitempty"`
+	Env      string         `yaml:"env"`
+	Theme    string         `yaml:"theme"`
+	Approval ApprovalConfig `yaml:"approval,omitempty"`
+	APIKey   string         `yaml:"-"`
 }
 
 // ActiveModel returns the most recently selected model, falling back to the
@@ -87,11 +113,12 @@ func readConfigFile() StubbsConfig {
 		return cfg
 	}
 	var fileCfg struct {
-		Provider string   `yaml:"provider"`
-		Model    string   `yaml:"model"` // legacy scalar
-		Models   []string `yaml:"models"`
-		Env      string   `yaml:"env"`
-		Theme    string   `yaml:"theme"`
+		Provider string         `yaml:"provider"`
+		Model    string         `yaml:"model"` // legacy scalar
+		Models   []string       `yaml:"models"`
+		Env      string         `yaml:"env"`
+		Theme    string         `yaml:"theme"`
+		Approval ApprovalConfig `yaml:"approval"`
 	}
 	if err := yaml.Unmarshal(b, &fileCfg); err != nil {
 		return cfg
@@ -99,6 +126,7 @@ func readConfigFile() StubbsConfig {
 	cfg.Provider = fileCfg.Provider
 	cfg.Env = fileCfg.Env
 	cfg.Theme = fileCfg.Theme
+	cfg.Approval = fileCfg.Approval
 	if len(fileCfg.Models) > 0 {
 		cfg.Models = fileCfg.Models
 	} else if fileCfg.Model != "" {
@@ -123,6 +151,9 @@ func fileOrDefaults() StubbsConfig {
 	}
 	if fileCfg.Theme != "" {
 		cfg.Theme = fileCfg.Theme
+	}
+	if fileCfg.Approval.Default != "" || len(fileCfg.Approval.Tools) > 0 {
+		cfg.Approval = fileCfg.Approval
 	}
 	return cfg
 }
@@ -237,7 +268,8 @@ func migrateLegacy() {
 
 func configFileHasSettings() bool {
 	c := readConfigFile()
-	return c.Provider != "" || len(c.Models) > 0 || c.Env != "" || c.Theme != ""
+	return c.Provider != "" || len(c.Models) > 0 || c.Env != "" || c.Theme != "" ||
+		c.Approval.Default != "" || len(c.Approval.Tools) > 0
 }
 
 func writeYAML(path string, cfg StubbsConfig) error {

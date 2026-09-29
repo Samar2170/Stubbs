@@ -84,7 +84,8 @@ type UI interface {
 type InteractiveConfig struct {
 	AgentConfig
 	Mode             Mode
-	WhitelistActions []string // regexes; matching commands skip confirmation
+	WhitelistActions []string          // regexes; matching commands skip confirmation
+	Approval         map[string]string // tool name -> "allow"; unlisted tools require confirmation
 	ConfirmExit      bool
 	AutoQuit         bool
 }
@@ -458,7 +459,7 @@ func (ia *InteractiveAgent) confirmCalls(calls []types.ToolCall) (bool, error) {
 	for _, call := range calls {
 		cmd := CommandOf(call)
 		commands = append(commands, cmd)
-		if !ia.whitelisted(cmd) {
+		if !ia.whitelisted(cmd) && !ia.approved(call.Function.Name) {
 			needsConfirm = true
 		}
 	}
@@ -514,6 +515,12 @@ func (ia *InteractiveAgent) whitelisted(cmd string) bool {
 		}
 	}
 	return false
+}
+
+// approved reports whether the tool is in the config allow-list. Every tool
+// requires confirmation unless explicitly allowed; yolo mode bypasses this.
+func (ia *InteractiveAgent) approved(tool string) bool {
+	return ia.cfg.Approval[tool] == "allow"
 }
 
 // CommandOf extracts the human-readable command from a tool call.
@@ -575,6 +582,13 @@ func fileCommandOf(call types.ToolCall) string {
 				return "list " + p + " (recursive)"
 			}
 			return "list " + p
+		}
+	case "web_fetch":
+		var a struct {
+			URL string `json:"url"`
+		}
+		if json.Unmarshal([]byte(call.Function.Arguments), &a) == nil && a.URL != "" {
+			return "fetch " + a.URL
 		}
 	}
 	return ""
