@@ -129,6 +129,13 @@ func run() error {
 	registry := types.NewRegistry()
 	bashTool := tools.NewBashTool()
 	bashTool.Dir = workdir
+	inWorkdir := cfg.Approval.InWorkdir
+	bashConfined := false
+	if inWorkdir && tools.SandboxAvailable("bwrap") {
+		bashTool.Confine = true
+		bashTool.SandboxHome = filepath.Join(config.ProjectDir, "sandbox-home")
+		bashConfined = true
+	}
 	registry.Register(bashTool)
 	readTool := tools.NewFileReadTool(workdir)
 	readTool.ReadSecrets = *readSecretsF
@@ -153,6 +160,8 @@ func run() error {
 		Mode:             mode,
 		WhitelistActions: *whitelistF,
 		Approval:         cfg.Approval.Tools,
+		InWorkdir:        inWorkdir,
+		BashConfined:     bashConfined,
 		ConfirmExit:      mode == agent.ModeConfirm && !*exitNowF,
 		AutoQuit:         *autoQuitF,
 	}

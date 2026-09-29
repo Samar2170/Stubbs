@@ -86,6 +86,8 @@ type InteractiveConfig struct {
 	Mode             Mode
 	WhitelistActions []string          // regexes; matching commands skip confirmation
 	Approval         map[string]string // tool name -> "allow"; unlisted tools require confirmation
+	InWorkdir        bool              // auto-approve actions guaranteed to stay inside the working directory
+	BashConfined     bool              // whether bash actually runs confined to the working directory
 	ConfirmExit      bool
 	AutoQuit         bool
 }
@@ -462,7 +464,7 @@ func (ia *InteractiveAgent) confirmCalls(calls []types.ToolCall) (bool, error) {
 	for _, call := range calls {
 		cmd := CommandOf(call)
 		commands = append(commands, cmd)
-		if !ia.whitelisted(cmd) && !ia.approved(call.Function.Name) {
+		if !ia.whitelisted(cmd) && !ia.approved(call.Function.Name) && !ia.withinWorkdir(call) {
 			needsConfirm = true
 		}
 	}
@@ -524,6 +526,23 @@ func (ia *InteractiveAgent) whitelisted(cmd string) bool {
 // requires confirmation unless explicitly allowed; yolo mode bypasses this.
 func (ia *InteractiveAgent) approved(tool string) bool {
 	return ia.cfg.Approval[tool] == "allow"
+}
+
+// withinWorkdir reports whether a call is guaranteed to stay inside the working
+// directory: the file tools enforce that themselves, and bash qualifies only
+// when the bash tool is actually running sandboxed there. This backs the
+// approval.in_workdir policy.
+func (ia *InteractiveAgent) withinWorkdir(call types.ToolCall) bool {
+	if !ia.cfg.InWorkdir {
+		return false
+	}
+	switch call.Function.Name {
+	case "file_read", "file_write", "file_edit", "file_list":
+		return true
+	case "bash":
+		return ia.cfg.BashConfined
+	}
+	return false
 }
 
 // CommandOf extracts the human-readable command from a tool call.

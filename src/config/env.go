@@ -32,9 +32,14 @@ func legacyConfigPath() string {
 // ApprovalConfig controls which tools may run without confirmation. Every tool
 // requires confirmation unless it is explicitly allowed; yolo mode bypasses
 // this policy entirely. Policies are "allow" or "confirm".
+//
+// InWorkdir auto-approves actions that are guaranteed to stay inside the
+// working directory: the file tools (already path-confined) and bash, which is
+// then run inside a bubblewrap sandbox confined to the working directory.
 type ApprovalConfig struct {
-	Default string            `yaml:"default,omitempty"`
-	Tools   map[string]string `yaml:"tools,omitempty"`
+	Default   string            `yaml:"default,omitempty"`
+	InWorkdir bool              `yaml:"in_workdir,omitempty"`
+	Tools     map[string]string `yaml:"tools,omitempty"`
 }
 
 const (
@@ -178,7 +183,7 @@ func fileOrDefaults() StubbsConfig {
 	if fileCfg.Theme != "" {
 		cfg.Theme = fileCfg.Theme
 	}
-	if fileCfg.Approval.Default != "" || len(fileCfg.Approval.Tools) > 0 {
+	if fileCfg.Approval.Default != "" || fileCfg.Approval.InWorkdir || len(fileCfg.Approval.Tools) > 0 {
 		cfg.Approval = fileCfg.Approval
 	}
 	if fileCfg.Memory != (MemoryConfig{}) {
@@ -298,7 +303,7 @@ func migrateLegacy() {
 func configFileHasSettings() bool {
 	c := readConfigFile()
 	return c.Provider != "" || len(c.Models) > 0 || c.Env != "" || c.Theme != "" ||
-		c.Approval.Default != "" || len(c.Approval.Tools) > 0
+		c.Approval.Default != "" || c.Approval.InWorkdir || len(c.Approval.Tools) > 0
 }
 
 func writeYAML(path string, cfg StubbsConfig) error {

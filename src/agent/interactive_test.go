@@ -111,12 +111,14 @@ func TestConfirmCallsRespectsApproval(t *testing.T) {
 	readCall := types.ToolCall{Function: types.FunctionCall{Name: "file_read", Arguments: `{"file_path":"a.go"}`}}
 
 	cases := []struct {
-		name        string
-		mode        Mode
-		approval    map[string]string
-		whitelist   []string
-		calls       []types.ToolCall
-		wantConfirm bool
+		name         string
+		mode         Mode
+		approval     map[string]string
+		whitelist    []string
+		inWorkdir    bool
+		bashConfined bool
+		calls        []types.ToolCall
+		wantConfirm  bool
 	}{
 		{
 			name:        "approved tool skips prompt",
@@ -152,6 +154,34 @@ func TestConfirmCallsRespectsApproval(t *testing.T) {
 			calls:       []types.ToolCall{bashCall},
 			wantConfirm: false,
 		},
+		{
+			name:         "in_workdir skips prompt for confined bash",
+			mode:         ModeConfirm,
+			inWorkdir:    true,
+			bashConfined: true,
+			calls:        []types.ToolCall{bashCall},
+			wantConfirm:  false,
+		},
+		{
+			name:        "in_workdir still prompts for unconfined bash",
+			mode:        ModeConfirm,
+			inWorkdir:   true,
+			calls:       []types.ToolCall{bashCall},
+			wantConfirm: true,
+		},
+		{
+			name:        "in_workdir skips prompt for file tools",
+			mode:        ModeConfirm,
+			inWorkdir:   true,
+			calls:       []types.ToolCall{readCall},
+			wantConfirm: false,
+		},
+		{
+			name:        "in_workdir off prompts for file tools",
+			mode:        ModeConfirm,
+			calls:       []types.ToolCall{readCall},
+			wantConfirm: true,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -161,7 +191,7 @@ func TestConfirmCallsRespectsApproval(t *testing.T) {
 				return "", nil
 			}}
 			ia := &InteractiveAgent{
-				cfg: InteractiveConfig{Mode: tc.mode, Approval: tc.approval},
+				cfg: InteractiveConfig{Mode: tc.mode, Approval: tc.approval, InWorkdir: tc.inWorkdir, BashConfined: tc.bashConfined},
 				ui:  ui,
 			}
 			ia.Agent = &Agent{config: &ia.cfg.AgentConfig}
