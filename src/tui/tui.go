@@ -325,34 +325,38 @@ type tLine struct {
 }
 
 type model struct {
-	opts      Options
-	app       *App
-	st        styles
-	w, h      int
-	inputH    int
-	blocks    []block
-	rows      []int // cumulative transcript line count per block
-	tLines    []tLine
-	selAnchor int // selection anchor line (-1 = no selection)
-	selHead   int // selection head line
-	selecting bool
-	stick     bool // follow the bottom of the transcript
-	showTools bool // global expand/collapse for tool output (start expanded)
-	dirty     bool
-	vp        viewport.Model
-	ta        textarea.Model
-	sp        spinner.Model
-	status    string
-	statusErr bool
-	working   bool
-	doneOk    bool
-	mode      agent.Mode
-	steps     int
-	cost      float32
-	pending   *pendingInput
-	dlg       *dialog
-	expanded  bool
-	done      bool
+	opts        Options
+	app         *App
+	st          styles
+	w, h        int
+	inputH      int
+	headerH     int // rows the header occupies
+	statusRows  int // rows budgeted to the status line
+	pendingRows int // rows budgeted to the pending prompt
+	blocks      []block
+	rows        []int // cumulative transcript line count per block
+	tLines      []tLine
+	selAnchor   int // selection anchor line (-1 = no selection)
+	selHead     int // selection head line
+	selecting   bool
+	stick       bool // follow the bottom of the transcript
+	showTools   bool // global expand/collapse for tool output (start expanded)
+	dirty       bool
+	vp          viewport.Model
+	ta          textarea.Model
+	sp          spinner.Model
+	status      string
+	statusErr   bool
+	working     bool
+	doneOk      bool
+	mode        agent.Mode
+	steps       int
+	cost        float32
+	pending     *pendingInput
+	menu        commandMenu
+	dlg         *dialog
+	expanded    bool
+	done        bool
 }
 
 func newTextarea() textarea.Model {
@@ -446,6 +450,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case inputReqMsg:
 		m.working = false
+		m.menu.close()
 		if msg.kind == inConfirm || msg.kind == inExit {
 			d := &dialog{reply: msg.reply}
 			if msg.kind == inConfirm {
@@ -466,6 +471,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case limitsReqMsg:
 		m.working = false
 		m.pending = &pendingInput{kind: inLimits, title: "Raise limits", reply: msg.reply}
+		m.menu.close()
 		m.ta.Placeholder = fmt.Sprintf("new limits, e.g. '%d %.2f'  ·  q ends the run", msg.stepLimit, msg.costLimit)
 		m.ta.Reset()
 		m.ta.Focus()
@@ -479,6 +485,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = msg.summary + " — ctrl+c or esc to quit"
 		m.doneOk = msg.ok
 		m.statusErr = !msg.ok
+		m.menu.close()
 		m.ta.Reset()
 		m.ta.Blur()
 		m.layout()
@@ -537,6 +544,24 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.dlg != nil {
 		return m.handleDialogKey(msg.String())
 	}
+	if m.menu.open {
+		switch msg.String() {
+		case "up", "ctrl+p":
+			m.menu.move(-1)
+			return m, nil
+		case "down", "ctrl+n":
+			m.menu.move(1)
+			return m, nil
+		case "tab":
+			return m, m.acceptCommand(false)
+		case "enter":
+			return m, m.acceptCommand(true)
+		case "esc":
+			m.menu.close()
+			m.layout()
+			return m, nil
+		}
+	}
 	switch msg.String() {
 	case "ctrl+c":
 		if m.done {
@@ -580,12 +605,15 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 // updateTA forwards msg to the composer and re-lays out the view when the
-// content grows or shrinks, so the box keeps the cursor visible.
+// content grows or shrinks, so the box keeps the cursor visible. It also keeps
+// the slash-command menu in step with what was typed.
 func (m *model) updateTA(msg tea.Msg) tea.Cmd {
 	before := m.desiredInputH()
+	menuBefore := m.menuHeight()
 	var cmd tea.Cmd
 	m.ta, cmd = m.ta.Update(msg)
-	if m.desiredInputH() != before {
+	m.syncMenu()
+	if m.desiredInputH() != before || m.menuHeight() != menuBefore {
 		m.layout()
 	}
 	return cmd
@@ -804,9 +832,13 @@ func (m *model) memoryCommand(text string) (tea.Cmd, bool) {
 		m.statusErr = false
 		if len(items) == 0 {
 			m.status = "memory is empty"
-		} else {
-			m.status = fmt.Sprintf("%d memories: %s", len(items), strings.Join(items, "; "))
+			return nil, true
 		}
+		// The listing can be long, so it goes into the scrollable transcript
+		// where each entry wraps; the status stays short so it does not crowd
+		// out the composer.
+		m.status = fmt.Sprintf("%d memories", len(items))
+		m.appendBlock(infoBlock{text: fmt.Sprintf("%d memories:\n%s", len(items), strings.Join(items, "\n"))})
 		return nil, true
 	case strings.HasPrefix(text, "/remember"):
 		body := strings.TrimSpace(strings.TrimPrefix(text, "/remember"))
@@ -858,6 +890,7 @@ func (m *model) memoryCommand(text string) (tea.Cmd, bool) {
 func (m *model) swapComposer(kind inputKind, title string, placeholder string) {
 	m.pending = &pendingInput{kind: kind, title: title, reply: m.dlg.reply}
 	m.dlg = nil
+	m.menu.close()
 	m.ta.Reset()
 	m.ta.Placeholder = placeholder
 	m.ta.Focus()
@@ -902,30 +935,35 @@ func (m *model) submitPending() tea.Cmd {
 		m.resolve(inputResult{text: fmt.Sprintf("%d %v", steps, cost)})
 		return nil
 	}
+	trimmedText := strings.TrimSpace(text)
 	// TUI-side: /m just expands the (already multiline) input box.
-	if strings.TrimSpace(text) == "/m" {
+	if trimmedText == "/m" {
 		m.expanded = true
 		m.layout()
 		m.ta.Reset()
+		m.syncMenu()
 		return nil
 	}
 	// TUI-side: /h opens the help overlay instead of going to the agent.
-	if strings.TrimSpace(text) == "/h" {
+	if trimmedText == "/h" {
 		m.ta.Reset()
+		m.menu.close()
 		m.dlg = newHelpDialog()
 		m.layout()
 		return nil
 	}
 	// TUI-side: /models opens the model picker instead of going to the agent.
-	if strings.TrimSpace(text) == "/models" {
+	if trimmedText == "/models" {
 		m.ta.Reset()
+		m.menu.close()
 		m.statusErr = false
 		m.status = "loading models…"
 		return m.loadModels()
 	}
 	// TUI-side memory commands never reach the agent.
-	if cmd, handled := m.memoryCommand(strings.TrimSpace(text)); handled {
+	if cmd, handled := m.memoryCommand(trimmedText); handled {
 		m.ta.Reset()
+		m.menu.close()
 		return cmd
 	}
 	// Echo conversation messages into the transcript so the user can see
@@ -964,6 +1002,7 @@ func (m *model) resetPrompt() {
 	m.status = ""
 	m.statusErr = false
 	m.working = false
+	m.menu.close()
 	m.ta.Reset()
 	m.ta.Placeholder = idlePlaceholder
 	m.ta.Focus()
@@ -1117,42 +1156,159 @@ func (m *model) layout() {
 	if m.w == 0 {
 		return
 	}
+	m.ta.SetWidth(max(m.w-2, 1))
+	m.headerH = m.headerHeight()
 	m.inputH = m.desiredInputH()
+	// Budget every transcript-external section so the whole view fits in h
+	// rows while keeping at least one transcript row. Trim the optional
+	// sections (pending prompt, then status, then the composer) until the view
+	// fits; only the status line and composer have a one-row floor.
+	statusWant := max(m.statusHeight(), 1)
+	pendingWant := m.pendingHeight()
+	for i := 0; i < 8; i++ {
+		m.statusRows, m.pendingRows = statusWant, pendingWant
+		m.ta.SetHeight(m.inputH)
+		over := m.usedRows() - (m.h - 1)
+		if over <= 0 {
+			break
+		}
+		if pendingWant > 0 {
+			d := min(over, pendingWant)
+			pendingWant -= d
+			over -= d
+		}
+		if over > 0 && statusWant > 1 {
+			d := min(over, statusWant-1)
+			statusWant -= d
+			over -= d
+		}
+		if over > 0 && m.inputH > 1 {
+			d := min(over, m.inputH-1)
+			m.inputH -= d
+			over -= d
+		}
+		if over <= 0 {
+			break
+		}
+	}
+	m.statusRows, m.pendingRows = statusWant, pendingWant
+	m.ta.SetHeight(m.inputH)
+	// Only a change of transcript width needs the (expensive) block re-render;
+	// height-only changes just resize the viewport.
+	if m.vp.Width != m.w {
+		m.dirty = true
+	}
 	m.vp.Width = m.w
 	m.vp.Height = max(m.h-m.usedRows(), 1)
-	m.ta.SetWidth(max(m.w-2, 1))
-	m.ta.SetHeight(m.inputH)
-	m.dirty = true
 }
 
-// desiredInputH is the composer height needed to show all of its content:
-// one row per logical line plus extra rows for long lines that wrap. The
-// expanded flag (ctrl+e, /m) acts as a minimum height, and the result is
-// capped so the transcript viewport always keeps at least one row.
+// desiredInputH is the composer height needed to show all of its content.
+// The textarea word-wraps, so we ask it (via textareaRows) how many display
+// rows the value needs instead of estimating; an underestimate makes the
+// textarea scroll and hides the first line. The expanded flag (ctrl+e, /m)
+// acts as a minimum height, and the result is capped so the transcript
+// viewport always keeps at least one row.
 func (m *model) desiredInputH() int {
 	w := max(m.w-2, 1) // same width layout() gives the textarea
-	rows := 0
-	for _, l := range strings.Split(m.ta.Value(), "\n") {
-		rows += max(1, (plainWidth(l)+w-1)/w)
-	}
+	rows := textareaRows(m.ta.Value(), w)
 	if m.expanded {
 		rows = max(rows, 8)
 	}
 	return min(rows, max(m.h-4, 1))
 }
 
-// usedRows counts every transcript-external row the view needs.
+// statusHeight is the number of rows statusLine() needs once wrapped.
+func (m *model) statusHeight() int {
+	text, _ := m.statusContent()
+	if text == "" {
+		return 0
+	}
+	return wrapHeight(text, m.w)
+}
+
+// pendingHeight is the number of rows the pending prompt title needs. The
+// body wraps at w-2 because the "❯ " prefix occupies two columns.
+func (m *model) pendingHeight() int {
+	if m.pending == nil {
+		return 0
+	}
+	return max(wrapHeight(m.pending.title, max(m.w-2, 1)), 1)
+}
+
+// pendingLine renders the pending prompt title, wrapped and with the "❯ "
+// marker on the first row. It is clipped to the row budget assigned by
+// layout() so it can never push the view off screen.
+func (m *model) pendingLine() string {
+	if m.pending == nil {
+		return ""
+	}
+	rows := m.pendingRows
+	if rows <= 0 {
+		rows = m.pendingHeight()
+	}
+	lines := strings.Split(wrapText(m.pending.title, max(m.w-2, 1)), "\n")
+	if len(lines) > rows {
+		lines = lines[:rows]
+	}
+	lines[0] = m.st.agent.Render("❯ ") + m.st.info.Render(lines[0])
+	for i := 1; i < len(lines); i++ {
+		lines[i] = "  " + m.st.info.Render(lines[i])
+	}
+	return strings.Join(lines, "\n")
+}
+
+// headerHeight is the number of rows the header occupies; it can wrap to two
+// rows on narrow terminals once the wordmark and mode badge no longer fit.
+func (m *model) headerHeight() int {
+	if m.w == 0 {
+		return 1
+	}
+	return max(len(strings.Split(m.header(), "\n")), 1)
+}
+
+// usedRows counts every transcript-external row the view needs, using the row
+// budgets layout() assigned.
 func (m *model) usedRows() int {
-	used := 2 // header + status line
+	used := max(m.headerH, 1) + max(m.statusRows, 1)
 	if m.dlg != nil {
 		used += lipgloss.Height(m.dlg.render(m.w, m.st))
 	} else {
-		if m.pending != nil {
-			used++
-		}
+		used += m.pendingRows
+		used += m.menuHeight()
 		used += m.inputH + 2 // composer border
 	}
 	return used
+}
+
+// wrapHeight is the number of display rows text occupies at the given width.
+func wrapHeight(text string, width int) int {
+	w := max(width, 1)
+	if text == "" {
+		return 0
+	}
+	rows := 0
+	for _, line := range strings.Split(text, "\n") {
+		rows += len(strings.Split(ansi.Wrap(line, w, ""), "\n"))
+	}
+	return max(rows, 1)
+}
+
+// wrapText soft-wraps text to width so it flows onto the next line instead of
+// running off the right edge. It wraps on spaces and only breaks mid-word when
+// a single token is wider than the available space.
+func wrapText(text string, width int) string {
+	w := max(width, 1)
+	if text == "" {
+		return ""
+	}
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		if ansi.StringWidth(line) <= w {
+			continue
+		}
+		lines[i] = ansi.Wrap(line, w, "")
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m *model) renderTranscript() {
@@ -1205,20 +1361,41 @@ func (m *model) busy() bool {
 	return m.working && !m.done && m.pending == nil && m.dlg == nil
 }
 
+// statusContent returns the status text (without style) and the style it
+// should be rendered in. Keeping the raw text in one place lets statusHeight
+// measure exactly what statusLine draws.
+func (m *model) statusContent() (string, lipgloss.Style) {
+	switch {
+	case m.busy():
+		return m.sp.View() + " " + m.status, m.st.info
+	case m.status == "":
+		return "ready", m.st.faint
+	case m.done && m.doneOk:
+		return "● " + m.status, m.st.ok
+	case m.statusErr:
+		return "● " + m.status, m.st.errStyle
+	default:
+		return m.status, m.st.dim
+	}
+}
+
+// statusLine wraps long statuses (e.g. a long /memory listing) so they stay
+// inside the terminal instead of running off the right edge. It is clipped to
+// the row budget assigned by layout().
 func (m *model) statusLine() string {
-	if m.busy() {
-		return m.sp.View() + " " + m.st.info.Render(m.status)
+	text, style := m.statusContent()
+	if text == "" {
+		return ""
 	}
-	if m.status == "" {
-		return m.st.faint.Render("ready")
+	rows := m.statusRows
+	if rows <= 0 {
+		rows = max(m.statusHeight(), 1)
 	}
-	if m.done && m.doneOk {
-		return m.st.ok.Render("● " + m.status)
+	lines := strings.Split(wrapText(text, m.w), "\n")
+	if len(lines) > rows {
+		lines = lines[:rows]
 	}
-	if m.statusErr {
-		return m.st.errStyle.Render("● " + m.status)
-	}
-	return m.st.dim.Render(m.status)
+	return style.Render(strings.Join(lines, "\n"))
 }
 
 func (m *model) header() string {
@@ -1235,6 +1412,10 @@ func (m *model) View() string {
 	if m.w == 0 {
 		return "loading…"
 	}
+	// Status text and the pending prompt change without going through layout(),
+	// so reflow here to keep their row budgets (and the composer/viewport
+	// sizes) in step. layout() is cheap unless the width changed.
+	m.layout()
 	if m.dirty {
 		m.renderTranscript()
 	}
@@ -1243,8 +1424,11 @@ func (m *model) View() string {
 		sheet := lipgloss.PlaceHorizontal(m.w, lipgloss.Center, m.dlg.render(m.w, m.st))
 		bottom = append(bottom, sheet)
 	} else {
-		if m.pending != nil {
-			bottom = append(bottom, m.st.agent.Render("❯ ")+m.st.info.Render(m.pending.title))
+		if m.pending != nil && m.pendingRows > 0 {
+			bottom = append(bottom, m.pendingLine())
+		}
+		if menu := m.renderMenu(); menu != "" {
+			bottom = append(bottom, menu)
 		}
 		box := m.st.box
 		if m.pending != nil || (!m.done && m.status == "") {
