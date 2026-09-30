@@ -98,13 +98,15 @@ func (m *model) menuHeight() int {
 }
 
 // menuLimit caps the menu so it never eats the whole transcript viewport.
-// layout() sets inputH before it asks for usedRows(), which is why the
-// composer height is already known here.
+// layout() sets inputH and the row budgets before it asks for usedRows(),
+// which is why they are already known here.
 func (m *model) menuLimit() int {
 	if m.h <= 0 {
 		return maxCommandRows
 	}
-	room := m.h - m.inputH - 7 // header+status, composer border, transcript row, menu border
+	// header + transcript row + composer border (2) + menu border (2) + the
+	// rows already budgeted to the status line and pending prompt.
+	room := m.h - m.inputH - 4 - max(m.headerH, 1) - max(m.statusRows, 1) - m.pendingRows
 	return max(1, min(maxCommandRows, room))
 }
 

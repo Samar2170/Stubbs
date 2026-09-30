@@ -352,12 +352,16 @@ func TestComposerAutoGrow(t *testing.T) {
 	}
 	m.expanded = false
 
-	// Tiny terminals cap the composer so the viewport keeps a row.
+	// Tiny terminals cap the composer so every other row (header, status and
+	// at least one transcript row) still fits on screen.
 	m.h = 8
 	m.ta.SetValue(strings.Repeat("x\n", 50))
 	m.layout()
-	if m.inputH != 4 {
-		t.Errorf("capped composer height = %d, want 4", m.inputH)
+	if m.inputH > 4 {
+		t.Errorf("capped composer height = %d, want <= 4", m.inputH)
+	}
+	if got := len(strings.Split(m.View(), "\n")); got > m.h {
+		t.Errorf("view is %d rows tall, want <= %d", got, m.h)
 	}
 }
 
