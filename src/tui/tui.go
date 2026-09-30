@@ -350,6 +350,7 @@ type model struct {
 	steps     int
 	cost      float32
 	pending   *pendingInput
+	menu      commandMenu
 	dlg       *dialog
 	expanded  bool
 	done      bool
@@ -446,6 +447,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case inputReqMsg:
 		m.working = false
+		m.menu.close()
 		if msg.kind == inConfirm || msg.kind == inExit {
 			d := &dialog{reply: msg.reply}
 			if msg.kind == inConfirm {
@@ -466,6 +468,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case limitsReqMsg:
 		m.working = false
 		m.pending = &pendingInput{kind: inLimits, title: "Raise limits", reply: msg.reply}
+		m.menu.close()
 		m.ta.Placeholder = fmt.Sprintf("new limits, e.g. '%d %.2f'  ·  q ends the run", msg.stepLimit, msg.costLimit)
 		m.ta.Reset()
 		m.ta.Focus()
@@ -479,6 +482,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = msg.summary + " — ctrl+c or esc to quit"
 		m.doneOk = msg.ok
 		m.statusErr = !msg.ok
+		m.menu.close()
 		m.ta.Reset()
 		m.ta.Blur()
 		m.layout()
@@ -537,6 +541,24 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.dlg != nil {
 		return m.handleDialogKey(msg.String())
 	}
+	if m.menu.open {
+		switch msg.String() {
+		case "up", "ctrl+p":
+			m.menu.move(-1)
+			return m, nil
+		case "down", "ctrl+n":
+			m.menu.move(1)
+			return m, nil
+		case "tab":
+			return m, m.acceptCommand(false)
+		case "enter":
+			return m, m.acceptCommand(true)
+		case "esc":
+			m.menu.close()
+			m.layout()
+			return m, nil
+		}
+	}
 	switch msg.String() {
 	case "ctrl+c":
 		if m.done {
@@ -580,12 +602,15 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 // updateTA forwards msg to the composer and re-lays out the view when the
-// content grows or shrinks, so the box keeps the cursor visible.
+// content grows or shrinks, so the box keeps the cursor visible. It also keeps
+// the slash-command menu in step with what was typed.
 func (m *model) updateTA(msg tea.Msg) tea.Cmd {
 	before := m.desiredInputH()
+	menuBefore := m.menuHeight()
 	var cmd tea.Cmd
 	m.ta, cmd = m.ta.Update(msg)
-	if m.desiredInputH() != before {
+	m.syncMenu()
+	if m.desiredInputH() != before || m.menuHeight() != menuBefore {
 		m.layout()
 	}
 	return cmd
@@ -858,6 +883,7 @@ func (m *model) memoryCommand(text string) (tea.Cmd, bool) {
 func (m *model) swapComposer(kind inputKind, title string, placeholder string) {
 	m.pending = &pendingInput{kind: kind, title: title, reply: m.dlg.reply}
 	m.dlg = nil
+	m.menu.close()
 	m.ta.Reset()
 	m.ta.Placeholder = placeholder
 	m.ta.Focus()
@@ -902,30 +928,35 @@ func (m *model) submitPending() tea.Cmd {
 		m.resolve(inputResult{text: fmt.Sprintf("%d %v", steps, cost)})
 		return nil
 	}
+	trimmedText := strings.TrimSpace(text)
 	// TUI-side: /m just expands the (already multiline) input box.
-	if strings.TrimSpace(text) == "/m" {
+	if trimmedText == "/m" {
 		m.expanded = true
 		m.layout()
 		m.ta.Reset()
+		m.syncMenu()
 		return nil
 	}
 	// TUI-side: /h opens the help overlay instead of going to the agent.
-	if strings.TrimSpace(text) == "/h" {
+	if trimmedText == "/h" {
 		m.ta.Reset()
+		m.menu.close()
 		m.dlg = newHelpDialog()
 		m.layout()
 		return nil
 	}
 	// TUI-side: /models opens the model picker instead of going to the agent.
-	if strings.TrimSpace(text) == "/models" {
+	if trimmedText == "/models" {
 		m.ta.Reset()
+		m.menu.close()
 		m.statusErr = false
 		m.status = "loading models…"
 		return m.loadModels()
 	}
 	// TUI-side memory commands never reach the agent.
-	if cmd, handled := m.memoryCommand(strings.TrimSpace(text)); handled {
+	if cmd, handled := m.memoryCommand(trimmedText); handled {
 		m.ta.Reset()
+		m.menu.close()
 		return cmd
 	}
 	// Echo conversation messages into the transcript so the user can see
@@ -964,6 +995,7 @@ func (m *model) resetPrompt() {
 	m.status = ""
 	m.statusErr = false
 	m.working = false
+	m.menu.close()
 	m.ta.Reset()
 	m.ta.Placeholder = idlePlaceholder
 	m.ta.Focus()
@@ -1150,6 +1182,7 @@ func (m *model) usedRows() int {
 		if m.pending != nil {
 			used++
 		}
+		used += m.menuHeight()
 		used += m.inputH + 2 // composer border
 	}
 	return used
@@ -1245,6 +1278,9 @@ func (m *model) View() string {
 	} else {
 		if m.pending != nil {
 			bottom = append(bottom, m.st.agent.Render("❯ ")+m.st.info.Render(m.pending.title))
+		}
+		if menu := m.renderMenu(); menu != "" {
+			bottom = append(bottom, menu)
 		}
 		box := m.st.box
 		if m.pending != nil || (!m.done && m.status == "") {
