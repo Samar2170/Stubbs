@@ -16,3 +16,18 @@ func TestORClientSetModel(t *testing.T) {
 		t.Fatalf("SetModel(\"\") should be ignored, got %q", got)
 	}
 }
+
+func TestORClientSetNativeTools(t *testing.T) {
+	c := NewORClient("key", []string{"a/one"}, nil)
+	if !c.sendTools {
+		t.Fatal("native tools should be enabled by default")
+	}
+	c.SetNativeTools(false)
+	if c.sendTools {
+		t.Fatal("SetNativeTools(false) should disable tool definitions")
+	}
+	c.SetNativeTools(true)
+	if !c.sendTools {
+		t.Fatal("SetNativeTools(true) should re-enable tool definitions")
+	}
+}

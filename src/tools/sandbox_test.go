@@ -131,20 +131,26 @@ func TestBashSandboxNoBackendError(t *testing.T) {
 	}
 }
 
-func TestBwrapArgvBindsPersistentTmp(t *testing.T) {
-	argv := bwrapArgv("bwrap", "/root", "/root/work", "/home/me", "/root/.stubbs/tmp", "true")
+func TestBwrapArgvSetsPersistentTmpdir(t *testing.T) {
+	argv := bwrapArgv("bwrap", "/root", "/root/work", "/home/me", "/home/me/scratch", "true")
 	joined := strings.Join(argv, " ")
-	if !strings.Contains(joined, "--bind /root/.stubbs/tmp /tmp") {
-		t.Fatalf("expected persistent /tmp bind, got: %s", joined)
+	if !strings.Contains(joined, "--setenv TMPDIR /home/me/scratch") {
+		t.Fatalf("expected TMPDIR to point at scratch, got: %s", joined)
 	}
-	if strings.Contains(joined, "--tmpfs /tmp") {
-		t.Fatalf("did not expect tmpfs when scratch is set: %s", joined)
+	if !strings.Contains(joined, "--tmpfs /tmp") {
+		t.Fatalf("/tmp should stay an ephemeral tmpfs, got: %s", joined)
+	}
+	if strings.Contains(joined, "--bind /home/me/scratch /tmp") {
+		t.Fatalf("scratch should not be bound over /tmp: %s", joined)
 	}
 }
 
-func TestBwrapArgvFallsBackToTmpfs(t *testing.T) {
+func TestBwrapArgvNoTmpdirKeepsTmpfs(t *testing.T) {
 	argv := bwrapArgv("bwrap", "/root", "/root/work", "", "", "true")
 	joined := strings.Join(argv, " ")
+	if strings.Contains(joined, "TMPDIR") {
+		t.Fatalf("TMPDIR should not be set without a scratch dir: %s", joined)
+	}
 	if !strings.Contains(joined, "--tmpfs /tmp") {
 		t.Fatalf("expected tmpfs fallback, got: %s", joined)
 	}

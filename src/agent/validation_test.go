@@ -1,8 +1,6 @@
 package agent
 
 import (
-	"context"
-	"encoding/json"
 	"strings"
 	"testing"
 
@@ -10,25 +8,16 @@ import (
 	"stubbs/src/types"
 )
 
-type fakeEnv struct{ names []string }
-
-func (f fakeEnv) Execute(context.Context, types.ToolCall) types.ExecutionOutput {
-	return types.ExecutionOutput{}
-}
-
-func (f fakeEnv) Has(name string) bool {
-	for _, n := range f.names {
-		if n == name {
-			return true
-		}
+func toolAgent(names ...string) *Agent {
+	set := make(map[string]bool, len(names))
+	for _, n := range names {
+		set[n] = true
 	}
-	return false
+	return &Agent{toolSet: set, toolNames: names, protocol: protocolNative}
 }
-
-func (f fakeEnv) ToolNames() []string { return f.names }
 
 func TestPartitionCalls(t *testing.T) {
-	ia := &InteractiveAgent{Agent: &Agent{Environment: fakeEnv{names: []string{"bash", "file_read"}}}}
+	ia := &InteractiveAgent{Agent: toolAgent("bash", "file_read")}
 	known, unknown := ia.partitionCalls([]types.ToolCall{
 		{Function: types.FunctionCall{Name: "bash"}},
 		{Function: types.FunctionCall{Name: "read"}},
@@ -42,24 +31,25 @@ func TestPartitionCalls(t *testing.T) {
 	}
 }
 
-func TestRejectCallsAnswersEveryCall(t *testing.T) {
+func newTestSession(t *testing.T) *Session {
+	t.Helper()
 	dir := t.TempDir()
 	old := config.SessionsDir
 	config.SessionsDir = dir
-	defer func() { config.SessionsDir = old }()
-
+	t.Cleanup(func() { config.SessionsDir = old })
 	s, err := newSession("test/model", "system")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
 
-	ia := &InteractiveAgent{Agent: &Agent{Environment: fakeEnv{names: []string{"bash"}}, Session: s}}
-	calls := []types.ToolCall{
-		{ID: "1", Function: types.FunctionCall{Name: "read"}},
-		{ID: "2", Function: types.FunctionCall{Name: "bash"}},
-	}
-	if err := ia.rejectCalls(calls); err != nil {
+func TestRejectCallsNativePairsEachCall(t *testing.T) {
+	s := newTestSession(t)
+	ia := &InteractiveAgent{Agent: &Agent{Session: s, protocol: protocolNative, toolSet: map[string]bool{"bash": true}, toolNames: []string{"bash"}}}
+
+	if err := ia.rejectCalls([]types.ToolCall{{ID: "1", Function: types.FunctionCall{Name: "read"}}}); err != nil {
 		t.Fatal(err)
 	}
 	var toolMsgs []types.Message
@@ -68,32 +58,33 @@ func TestRejectCallsAnswersEveryCall(t *testing.T) {
 			toolMsgs = append(toolMsgs, m)
 		}
 	}
-	if len(toolMsgs) != 2 {
-		t.Fatalf("got %d tool responses, want 2", len(toolMsgs))
-	}
-	if toolMsgs[0].ToolCallID != "1" {
-		t.Fatalf("first response = %+v", toolMsgs[0])
+	if len(toolMsgs) != 1 || toolMsgs[0].ToolCallID != "1" {
+		t.Fatalf("tool responses = %+v", toolMsgs)
 	}
 	if !strings.Contains(toolMsgs[0].Content, "unknown tool") {
-		t.Fatalf("unknown tool response lacked guidance: %q", toolMsgs[0].Content)
-	}
-	if !strings.Contains(toolMsgs[1].Content, "not executed") {
-		t.Fatalf("known tool response should be marked not executed: %q", toolMsgs[1].Content)
+		t.Fatalf("response lacked guidance: %q", toolMsgs[0].Content)
 	}
 }
 
-type promptTool struct{ name string }
+func TestRejectCallsTextUsesUserTurn(t *testing.T) {
+	s := newTestSession(t)
+	ia := &InteractiveAgent{Agent: &Agent{Session: s, protocol: protocolText, toolSet: map[string]bool{"bash": true}, toolNames: []string{"bash"}}}
 
-func (p promptTool) Name() string                { return p.name }
-func (p promptTool) Description() string         { return "" }
-func (p promptTool) Parameters() json.RawMessage { return json.RawMessage(`{}`) }
-func (p promptTool) Execute(context.Context, string) types.ExecutionOutput {
-	return types.ExecutionOutput{}
+	if err := ia.rejectCalls([]types.ToolCall{{ID: "1", Function: types.FunctionCall{Name: "read"}}}); err != nil {
+		t.Fatal(err)
+	}
+	last := s.Messages[len(s.Messages)-1]
+	if last.Role != types.RoleUser {
+		t.Fatalf("text protocol should feed corrections as a user turn, got %q", last.Role)
+	}
+	if !strings.Contains(last.Content, "Unknown tool") {
+		t.Fatalf("correction lacked guidance: %q", last.Content)
+	}
 }
 
 func TestSystemPromptListsToolsAndGuidance(t *testing.T) {
-	p := SystemPromptFor([]types.Tool{promptTool{"file_edit"}, promptTool{"bash"}})
-	for _, want := range []string{"bash", "file_edit", "never write tool calls as text", "do not rely on /tmp"} {
+	p := SystemPromptFor([]string{"file_edit", "bash"})
+	for _, want := range []string{"bash", "file_edit", "never write tool calls as text", "do not rely on the sandbox /tmp path"} {
 		if !strings.Contains(p, want) {
 			t.Fatalf("system prompt missing %q:\n%s", want, p)
 		}

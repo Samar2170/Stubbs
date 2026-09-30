@@ -5,115 +5,110 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync/atomic"
 
 	"stubbs/src/types"
 )
 
-// Some models (notably on OpenRouter) answer with tool-call markup embedded in
-// the message content instead of the provider's native tool_calls field. The
-// harness still expects structured calls, so recover the common formats here.
+// Tool-call transport. Most providers support native function calling, so the
+// harness sends tool definitions and reads structured tool_calls. Some models
+// do not, and answer with tool-call markup in the message body instead. Rather
+// than fabricating native calls from that text, the agent detects the
+// mismatch, drops to a text protocol for the session, and parses the
+// documented fenced format from then on.
 //
-// Supported:
+// Text protocol format:
 //
-//	<function_calls><invoke name="file_edit">
-//	  <parameter name="file_path" string="true">src/x.go</parameter>
-//	</invoke></function_calls>
+//	```stubbs-tool
+//	{"name": "bash", "arguments": {"command": "ls"}}
+//	```
 //
-//	<tool_call>{"name":"bash","arguments":{"command":"ls"}}</tool_call>
+// A single block may also contain a JSON array of call objects.
 
 var (
-	invokeRe   = regexp.MustCompile(`(?s)<invoke\s+name="([^"]+)"\s*>(.*?)</invoke>`)
-	paramRe    = regexp.MustCompile(`(?s)<parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>(.*?)</parameter>`)
-	toolCallRe = regexp.MustCompile(`(?s)<tool_call>\s*(\{.*?\})\s*</tool_call>`)
-	markupRe   = regexp.MustCompile(`(?s)<(?:function_calls|tool_calls|invoke|tool_call|parameter)\b|\s+string="(?:true|false)">`)
-	wrapperRe  = regexp.MustCompile(`(?s)</?(?:function_calls|tool_calls)>`)
+	// markupRe recognizes tool-call markup that is not the text protocol, used
+	// only to detect that the model ignored native function calling.
+	markupRe = regexp.MustCompile(`(?s)<(?:function_calls|tool_calls|invoke|tool_call|parameter)\b|\s+string="(?:true|false)">`)
+
+	textToolRe = regexp.MustCompile("(?s)```stubbs-tool[^\\n]*\\n(.*?)```")
 )
 
-// looksLikeToolMarkup reports whether content contains tool-call markup that
-// the parser should have handled.
+var textCallSeq atomic.Uint64
+
+func nextTextCallID() string {
+	return fmt.Sprintf("text_call_%d", textCallSeq.Add(1))
+}
+
+// looksLikeToolMarkup reports whether content contains tool-call markup that is
+// neither native tool_calls nor the text protocol.
 func looksLikeToolMarkup(content string) bool {
 	return markupRe.MatchString(content)
 }
 
-// parseToolCalls recovers tool calls from assistant content. It returns the
-// parsed calls, the content with the recognized markup removed, and whether
-// anything was parsed.
-func parseToolCalls(content string) (calls []types.ToolCall, stripped string, ok bool) {
+// parseTextToolCalls extracts calls from the text protocol. sawMarkup is true
+// when a stubbs-tool block was present even if its body was not valid JSON.
+func parseTextToolCalls(content string) (calls []types.ToolCall, stripped string, sawMarkup bool) {
 	stripped = content
-	addCall := func(name string, args map[string]any) {
-		argsJSON, err := json.Marshal(args)
-		if err != nil {
-			return
+	for _, m := range textToolRe.FindAllStringSubmatch(content, -1) {
+		sawMarkup = true
+		parsed, ok := decodeTextCalls(strings.TrimSpace(m[1]))
+		if !ok {
+			continue
 		}
-		calls = append(calls, types.ToolCall{
-			ID:   fmt.Sprintf("call_parsed_%d", len(calls)+1),
-			Type: "function",
-			Function: types.FunctionCall{
-				Name:      name,
-				Arguments: string(argsJSON),
-			},
-		})
+		calls = append(calls, parsed...)
+		stripped = strings.Replace(stripped, m[0], "", 1)
 	}
+	return calls, strings.TrimSpace(stripped), sawMarkup
+}
 
-	for _, m := range invokeRe.FindAllStringSubmatch(content, -1) {
-		name := strings.TrimSpace(m[1])
+type textCall struct {
+	Name      string          `json:"name"`
+	Arguments json.RawMessage `json:"arguments"`
+}
+
+func decodeTextCalls(block string) ([]types.ToolCall, bool) {
+	var raw []textCall
+	if err := json.Unmarshal([]byte(block), &raw); err != nil {
+		var one textCall
+		if err2 := json.Unmarshal([]byte(block), &one); err2 != nil {
+			return nil, false
+		}
+		raw = []textCall{one}
+	}
+	out := make([]types.ToolCall, 0, len(raw))
+	for _, c := range raw {
+		name := strings.TrimSpace(c.Name)
 		if name == "" {
 			continue
 		}
-		args := map[string]any{}
-		for _, p := range paramRe.FindAllStringSubmatch(m[2], -1) {
-			key := strings.TrimSpace(p[1])
-			if key == "" {
-				continue
-			}
-			args[key] = paramValue(p[3], p[2] == "false")
-		}
-		addCall(name, args)
-		stripped = strings.Replace(stripped, m[0], "", 1)
-	}
-
-	for _, m := range toolCallRe.FindAllStringSubmatch(content, -1) {
-		var raw struct {
-			Name      string          `json:"name"`
-			Arguments json.RawMessage `json:"arguments"`
-		}
-		if json.Unmarshal([]byte(m[1]), &raw) != nil || strings.TrimSpace(raw.Name) == "" {
-			continue
-		}
 		argStr := "{}"
-		if len(raw.Arguments) > 0 {
+		if len(c.Arguments) > 0 {
 			var asString string
-			if json.Unmarshal(raw.Arguments, &asString) == nil {
+			if json.Unmarshal(c.Arguments, &asString) == nil {
 				argStr = asString
 			} else {
-				argStr = string(raw.Arguments)
+				argStr = string(c.Arguments)
 			}
 		}
-		calls = append(calls, types.ToolCall{
-			ID:   fmt.Sprintf("call_parsed_%d", len(calls)+1),
-			Type: "function",
-			Function: types.FunctionCall{
-				Name:      strings.TrimSpace(raw.Name),
-				Arguments: argStr,
-			},
+		out = append(out, types.ToolCall{
+			ID:       nextTextCallID(),
+			Type:     "function",
+			Function: types.FunctionCall{Name: name, Arguments: argStr},
 		})
-		stripped = strings.Replace(stripped, m[0], "", 1)
 	}
-
-	stripped = wrapperRe.ReplaceAllString(stripped, "")
-	return calls, strings.TrimSpace(stripped), len(calls) > 0
+	return out, len(out) > 0
 }
 
-// paramValue normalizes an XML parameter value. Anthropic marks non-string
-// parameters with string="false"; those are parsed as JSON so booleans and
-// numbers survive the round-trip. Everything else stays a string.
-func paramValue(value string, nonString bool) any {
-	if !nonString {
-		return value
+// textToolInstruction explains the text protocol to a model that cannot use
+// native function calling.
+func textToolInstruction(names []string) string {
+	var b strings.Builder
+	b.WriteString("Native function calling is unavailable for this model, so a text tool protocol is in use. To run a tool, reply with one fenced block:\n\n")
+	b.WriteString("```stubbs-tool\n{\"name\": \"<tool>\", \"arguments\": {\"<arg>\": \"<value>\"}}\n```\n\n")
+	b.WriteString("A block may contain a JSON array of several call objects. ")
+	if len(names) > 0 {
+		fmt.Fprintf(&b, "Available tools: %s. Use only those names. ", strings.Join(names, ", "))
 	}
-	var v any
-	if json.Unmarshal([]byte(strings.TrimSpace(value)), &v) == nil {
-		return v
-	}
-	return value
+	b.WriteString("Never emit XML or any other tool-call format. When you are done, reply normally with no block.")
+	return b.String()
 }

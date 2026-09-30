@@ -2,49 +2,16 @@ package agent
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
-func TestParseAnthropicXMLToolCalls(t *testing.T) {
-	content := `<function_calls>
-<invoke name="file_edit">
-<parameter name="file_path" string="true">src/x.go</parameter>
-<parameter name="old_string" string="true">a</parameter>
-<parameter name="new_string" string="true">b</parameter>
-<parameter name="append" string="false">true</parameter>
-</invoke>
-</function_calls>`
+func TestParseTextToolCallSingle(t *testing.T) {
+	content := "Running it now.\n\n```stubbs-tool\n{\"name\": \"bash\", \"arguments\": {\"command\": \"ls -la\"}}\n```"
 
-	calls, stripped, ok := parseToolCalls(content)
-	if !ok || len(calls) != 1 {
-		t.Fatalf("calls = %+v, ok = %v", calls, ok)
-	}
-	if calls[0].Function.Name != "file_edit" {
-		t.Fatalf("name = %q", calls[0].Function.Name)
-	}
-	var args struct {
-		FilePath string `json:"file_path"`
-		Old      string `json:"old_string"`
-		Append   bool   `json:"append"`
-	}
-	if err := json.Unmarshal([]byte(calls[0].Function.Arguments), &args); err != nil {
-		t.Fatalf("arguments not valid JSON: %q: %v", calls[0].Function.Arguments, err)
-	}
-	if args.FilePath != "src/x.go" || args.Old != "a" || !args.Append {
-		t.Fatalf("args = %+v", args)
-	}
-	if stripped != "" {
-		t.Fatalf("stripped = %q, want empty", stripped)
-	}
-}
-
-func TestParseJSONToolCall(t *testing.T) {
-	content := `Let me run it.
-<tool_call>{"name":"bash","arguments":{"command":"ls -la"}}</tool_call>`
-
-	calls, stripped, ok := parseToolCalls(content)
-	if !ok || len(calls) != 1 {
-		t.Fatalf("calls = %+v, ok = %v", calls, ok)
+	calls, stripped, saw := parseTextToolCalls(content)
+	if !saw || len(calls) != 1 {
+		t.Fatalf("calls = %+v, saw = %v", calls, saw)
 	}
 	if calls[0].Function.Name != "bash" {
 		t.Fatalf("name = %q", calls[0].Function.Name)
@@ -58,40 +25,62 @@ func TestParseJSONToolCall(t *testing.T) {
 	if args.Command != "ls -la" {
 		t.Fatalf("command = %q", args.Command)
 	}
-	if stripped != "Let me run it." {
+	if stripped != "Running it now." {
 		t.Fatalf("stripped = %q", stripped)
 	}
 }
 
-func TestParseMultipleInvokes(t *testing.T) {
-	content := `<function_calls>
-<invoke name="file_read"><parameter name="file_path" string="true">a.go</parameter></invoke>
-<invoke name="file_read"><parameter name="file_path" string="true">b.go</parameter></invoke>
-</function_calls>`
+func TestParseTextToolCallArray(t *testing.T) {
+	content := "```stubbs-tool\n[{\"name\":\"file_read\",\"arguments\":{\"file_path\":\"a.go\"}},{\"name\":\"file_read\",\"arguments\":{\"file_path\":\"b.go\"}}]\n```"
 
-	calls, _, ok := parseToolCalls(content)
-	if !ok || len(calls) != 2 {
-		t.Fatalf("calls = %+v, ok = %v", calls, ok)
+	calls, _, saw := parseTextToolCalls(content)
+	if !saw || len(calls) != 2 {
+		t.Fatalf("calls = %+v, saw = %v", calls, saw)
 	}
 	if calls[0].ID == calls[1].ID {
-		t.Fatalf("parsed calls must have unique ids: %+v", calls)
+		t.Fatalf("ids must be unique: %+v", calls)
 	}
 }
 
-func TestMalformedMarkupIsDetectedNotParsed(t *testing.T) {
-	// The exact tail seen leaking into content in the wild.
-	content := "Here is my plan.\n\nfile_path\" string=\"true\">src/tui/blocks.go"
-	if !looksLikeToolMarkup(content) {
-		t.Fatal("leaked parameter markup should be detected")
-	}
-	calls, _, ok := parseToolCalls(content)
-	if ok || len(calls) != 0 {
-		t.Fatalf("malformed fragment should not parse into calls: %+v", calls)
+func TestParseTextToolCallArgumentsAsString(t *testing.T) {
+	content := "```stubbs-tool\n{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"}\n```"
+	calls, _, _ := parseTextToolCalls(content)
+	if len(calls) != 1 || calls[0].Function.Arguments != `{"command":"pwd"}` {
+		t.Fatalf("calls = %+v", calls)
 	}
 }
 
-func TestPlainTextIsNotMarkup(t *testing.T) {
+func TestMalformedTextBlockDetected(t *testing.T) {
+	content := "```stubbs-tool\n{not json}\n```"
+	calls, _, saw := parseTextToolCalls(content)
+	if !saw {
+		t.Fatal("a stubbs-tool block should be detected even when malformed")
+	}
+	if len(calls) != 0 {
+		t.Fatalf("malformed block should not produce calls: %+v", calls)
+	}
+}
+
+func TestLooksLikeToolMarkup(t *testing.T) {
+	markup := []string{
+		`<invoke name="bash">`,
+		`Here is my plan.\n\nfile_path" string="true">src/tui/blocks.go`,
+	}
+	for _, s := range markup {
+		if !looksLikeToolMarkup(s) {
+			t.Fatalf("expected markup: %q", s)
+		}
+	}
 	if looksLikeToolMarkup("I edited src/tui/blocks.go and ran the tests.") {
-		t.Fatal("plain prose should not look like tool markup")
+		t.Fatal("plain prose should not look like markup")
+	}
+}
+
+func TestTextToolInstructionListsTools(t *testing.T) {
+	got := textToolInstruction([]string{"bash", "file_edit"})
+	for _, want := range []string{"stubbs-tool", "bash", "file_edit", "Never emit XML"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("instruction missing %q:\n%s", want, got)
+		}
 	}
 }

@@ -95,18 +95,33 @@ func (s *Session) AppendToolResult(call types.ToolCall, out types.ExecutionOutpu
 	defer s.mu.Unlock()
 	s.Messages = append(s.Messages, msg)
 	s.context.AddMessage(msg)
-	rec := sessionRecord{
+	return s.write(toolRecord(call, out, s.model))
+}
+
+// AppendToolEvent records a tool execution without adding a tool message to the
+// API history. The text tool protocol has no native call/response pairing, so
+// results are fed back as a user turn instead.
+func (s *Session) AppendToolEvent(call types.ToolCall, out types.ExecutionOutput) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.write(toolRecord(call, out, s.model))
+}
+
+func toolRecord(call types.ToolCall, out types.ExecutionOutput, model string) sessionRecord {
+	return sessionRecord{
 		Timestamp:  time.Now(),
-		Type:       msg.Role,
-		Content:    msg.Content,
+		Type:       types.RoleTool,
+		Content:    renderExecution(out),
 		ToolCallID: call.ID,
 		Name:       call.Function.Name,
 		Error:      out.Error,
 		Code:       out.Code,
 		DurationMS: out.Duration.Milliseconds(),
-		Model:      s.model,
+		Model:      model,
 	}
-	return s.write(rec)
 }
 
 // AppendError records a non-fatal error (model call failure, retry, malformed

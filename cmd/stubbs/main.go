@@ -152,12 +152,18 @@ func run() error {
 	client := llm.NewORClient(cfg.APIKey, []string{model}, registry, llm.WithTimeout(*llmTimeoutF))
 	environ := env.NewLocalEnvironment(env.EnvironmentConfig{WorkingDir: workdir, Timeout: *envTimeoutF}, registry)
 
+	toolNames := make([]string, 0)
+	for _, t := range registry.List() {
+		toolNames = append(toolNames, t.Name())
+	}
+
 	iCfg := agent.InteractiveConfig{
 		AgentConfig: agent.AgentConfig{
 			StepLimit:    *stepsF,
 			CostLimit:    float32(*costF),
 			WorkingDir:   workdir,
-			SystemPrompt: agent.SystemPromptFor(registry.List()),
+			SystemPrompt: agent.SystemPromptFor(toolNames),
+			ToolNames:    toolNames,
 			Memory:       memStore,
 		},
 		Mode:             mode,

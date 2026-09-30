@@ -19,12 +19,26 @@ const maxAttempts = 3
 
 type ORClient struct {
 	apiKey    string
-	mu        sync.RWMutex // guards models; the active model can change at runtime
+	mu        sync.RWMutex // guards models/sendTools; the active model can change at runtime
 	models    []string
 	maxTokens int
 	baseURL   string
 	hc        *http.Client
 	Tools     []types.Tool
+	// sendTools controls whether tool definitions are sent with requests. It is
+	// cleared when the agent falls back to the text tool protocol.
+	sendTools bool
+}
+
+// SetNativeTools enables or disables sending tool definitions. It is safe to
+// call while a request is in flight.
+func (c *ORClient) SetNativeTools(enabled bool) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.sendTools = enabled
+	c.mu.Unlock()
 }
 
 // SetModel switches the active model. The change takes effect on the next
@@ -136,10 +150,11 @@ func NewORClient(apiKey string, modelIDs []string, toolRegistry *types.Registry,
 		modelIDs = []string{"z-ai/glm-5.3-flash"}
 	}
 	c := &ORClient{
-		apiKey:  apiKey,
-		models:  modelIDs,
-		baseURL: defaultBaseURL,
-		hc:      &http.Client{Timeout: 3 * time.Minute},
+		apiKey:    apiKey,
+		models:    modelIDs,
+		baseURL:   defaultBaseURL,
+		hc:        &http.Client{Timeout: 3 * time.Minute},
+		sendTools: true,
 	}
 	if toolRegistry != nil {
 		c.Tools = toolRegistry.List()
@@ -169,7 +184,14 @@ func (c *ORClient) toolDefinitions() []types.ToolDefinition {
 }
 
 func (c *ORClient) CompleteText(ctx context.Context, messages []types.Message) (ORChatResponse, error) {
-	return c.complete(ctx, messages, c.toolDefinitions())
+	c.mu.RLock()
+	send := c.sendTools
+	c.mu.RUnlock()
+	var tools []types.ToolDefinition
+	if send {
+		tools = c.toolDefinitions()
+	}
+	return c.complete(ctx, messages, tools)
 }
 
 // Complete is like CompleteText but does not offer any tools. It is used for

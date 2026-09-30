@@ -195,7 +195,7 @@ func (ia *InteractiveAgent) Run(ctx context.Context, task string) (string, error
 				continue
 			}
 		}
-		msg, err := ia.modelStep(ctx)
+		mr, err := ia.modelStep(ctx)
 		if err != nil {
 			if ia.takeInterrupt() {
 				if cerr := ia.interruptComment(); cerr != nil {
@@ -205,12 +205,17 @@ func (ia *InteractiveAgent) Run(ctx context.Context, task string) (string, error
 			}
 			return "", err
 		}
+		msg := mr.msg
+		calls := msg.ToolCalls
+		if a.protocol == protocolText {
+			calls = mr.textCalls
+		}
 		ia.ui.Assistant(a.Steps, a.Cost, msg)
-		if len(msg.ToolCalls) == 0 {
-			// Some models put tool calls in the text body instead of the native
-			// field. respond() repairs well-formed markup; if markup remains it
-			// was malformed, so ask the model to try again with real calls.
-			if looksLikeToolMarkup(msg.Content) && malformedTurns < maxMalformedRetries {
+		if len(calls) == 0 {
+			// A reply with unparseable tool markup is not a final answer; ask
+			// the model to retry with the correct format.
+			failed := mr.parseFailed || looksLikeToolMarkup(msg.Content)
+			if failed && malformedTurns < maxMalformedRetries {
 				malformedTurns++
 				if err := a.rejectMalformed(msg.Content); err != nil {
 					return "", err
@@ -235,20 +240,26 @@ func (ia *InteractiveAgent) Run(ctx context.Context, task string) (string, error
 		}
 		malformedTurns = 0
 		// Reject hallucinated tool names before asking the user to approve a
-		// tool that does not exist. Every call in the step gets a tool response
-		// so the assistant tool_calls stay paired for the next API request.
-		if _, unknown := ia.partitionCalls(msg.ToolCalls); len(unknown) > 0 {
+		// tool that does not exist. Valid calls in the same step still run.
+		known, unknown := ia.partitionCalls(calls)
+		if len(unknown) > 0 {
 			unknownTurns++
-			if err := ia.rejectCalls(msg.ToolCalls); err != nil {
+			if err := ia.rejectCalls(unknown); err != nil {
 				return "", err
 			}
-			if unknownTurns >= maxMalformedRetries {
+			if len(known) == 0 && unknownTurns >= maxMalformedRetries {
 				return "", fmt.Errorf("agent: model repeatedly called unknown tools")
+			}
+		} else {
+			unknownTurns = 0
+		}
+		if len(known) == 0 {
+			if err := ia.maybeComment(); err != nil {
+				return "", err
 			}
 			continue
 		}
-		unknownTurns = 0
-		approved, err := ia.confirmCalls(msg.ToolCalls)
+		approved, err := ia.confirmCalls(known)
 		if err != nil {
 			// TODO: this block is repeated way too much
 			cont, rerr := ia.promptErr(err)
@@ -263,18 +274,18 @@ func (ia *InteractiveAgent) Run(ctx context.Context, task string) (string, error
 		if !approved {
 			continue
 		}
-		ia.ui.Status(fmt.Sprintf("running %s...", plural(len(msg.ToolCalls), "command")))
+		ia.ui.Status(fmt.Sprintf("running %s...", plural(len(known), "command")))
 		// Register a cancel for tool execution too, so ESC/ctrl-c can stop a
 		// long-running command instead of leaving the UI apparently frozen.
 		runCtx, cancelRuns := context.WithCancel(ctx)
 		ia.setStepCancel(cancelRuns)
-		outputs, err := a.executeRuns(runCtx, msg.ToolCalls)
+		outputs, err := a.executeRuns(runCtx, known)
 		ia.setStepCancel(nil)
 		cancelRuns()
 		if err != nil {
 			return "", err
 		}
-		for i, call := range msg.ToolCalls {
+		for i, call := range known {
 			ia.ui.Observation(call, outputs[i])
 		}
 		if err := ia.maybeComment(); err != nil {
@@ -284,27 +295,30 @@ func (ia *InteractiveAgent) Run(ctx context.Context, task string) (string, error
 
 }
 
-func (ia *InteractiveAgent) modelStep(ctx context.Context) (types.Message, error) {
+func (ia *InteractiveAgent) modelStep(ctx context.Context) (modelResponse, error) {
 	for {
 		ia.ui.Status("waiting for LLM...")
 		sctx, cancel := context.WithCancel(ctx)
 		ia.setStepCancel(cancel)
-		msg, err := ia.Agent.respond(sctx)
+		mr, err := ia.Agent.respond(sctx)
 		cancel()
 		ia.setStepCancel(nil)
+		if errors.Is(err, errRetryTurn) {
+			continue
+		}
 		if err == nil {
-			return msg, nil
+			return mr, nil
 		}
 		if ctx.Err() != nil {
-			return types.Message{}, ctx.Err()
+			return modelResponse{}, ctx.Err()
 		}
 		if ia.takeInterrupt() {
 			if cerr := ia.interruptComment(); cerr != nil {
-				return types.Message{}, cerr
+				return modelResponse{}, cerr
 			}
 			continue
 		}
-		return types.Message{}, err
+		return modelResponse{}, err
 	}
 }
 
@@ -538,9 +552,8 @@ func (ia *InteractiveAgent) confirmCalls(calls []types.ToolCall) (bool, error) {
 // partitionCalls splits calls into those whose tool is registered and those
 // that name a nonexistent tool (a common model hallucination).
 func (ia *InteractiveAgent) partitionCalls(calls []types.ToolCall) (known, unknown []types.ToolCall) {
-	env := ia.Agent.Environment
 	for _, call := range calls {
-		if env != nil && env.Has(call.Function.Name) {
+		if ia.Agent.hasTool(call.Function.Name) {
 			known = append(known, call)
 		} else {
 			unknown = append(unknown, call)
@@ -549,31 +562,28 @@ func (ia *InteractiveAgent) partitionCalls(calls []types.ToolCall) (known, unkno
 	return known, unknown
 }
 
-// rejectCalls answers every call in a step that contained an unknown tool. The
-// unknown ones get an actionable error; the rest are marked not executed so the
-// assistant's tool_calls remain paired with tool responses.
+// rejectCalls reports unknown tool names back to the model. In the native
+// protocol each call gets a matching tool response; in the text protocol the
+// feedback is a single user turn, since there is no call/response pairing.
 func (ia *InteractiveAgent) rejectCalls(calls []types.ToolCall) error {
 	a := ia.Agent
-	available := ia.toolNames()
-	for _, call := range calls {
-		var out types.ExecutionOutput
-		if a.Environment == nil || !a.Environment.Has(call.Function.Name) {
-			out.Error = fmt.Sprintf("unknown tool %q; available: %v", call.Function.Name, available)
-		} else {
-			out.Error = fmt.Sprintf("not executed: this step also called an unknown tool; available: %v", available)
+	available := a.toolNameList()
+	if a.protocol == protocolText {
+		var b strings.Builder
+		for _, call := range calls {
+			fmt.Fprintf(&b, "Unknown tool %q. ", call.Function.Name)
 		}
+		fmt.Fprintf(&b, "Available tools: %v.", available)
+		return a.appendMessage(types.Message{Role: types.RoleUser, Content: b.String()})
+	}
+	availableErr := fmt.Sprintf("unknown tool %%q; available: %v", available)
+	for _, call := range calls {
+		out := types.ExecutionOutput{Error: fmt.Sprintf(availableErr, call.Function.Name)}
 		if err := a.appendToolResult(call, out); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-func (ia *InteractiveAgent) toolNames() []string {
-	if ia.Agent == nil || ia.Agent.Environment == nil {
-		return nil
-	}
-	return ia.Agent.Environment.ToolNames()
 }
 
 func (ia *InteractiveAgent) whitelisted(cmd string) bool {
