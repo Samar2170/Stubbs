@@ -96,7 +96,14 @@ func (s bashSandbox) Command(cmd string) (commandSpec, error) {
 				return commandSpec{}, fmt.Errorf("create sandbox home %s: %w", home, err)
 			}
 		}
-		return commandSpec{Argv: bwrapArgv(bwrap, root, work, home, cmd), Dir: work, Sandboxed: true}, nil
+		// Bind a persistent scratch dir over /tmp so files written by one
+		// command survive to the next (a private tmpfs would discard them).
+		// Fall back to a tmpfs if the scratch dir cannot be created.
+		scratch := filepath.Join(root, ".stubbs", "tmp")
+		if err := os.MkdirAll(scratch, 0o755); err != nil {
+			scratch = ""
+		}
+		return commandSpec{Argv: bwrapArgv(bwrap, root, work, home, scratch, cmd), Dir: work, Sandboxed: true}, nil
 	default:
 		return commandSpec{}, fmt.Errorf("unknown bash sandbox backend %q", backend)
 	}
@@ -114,18 +121,24 @@ func SandboxAvailable(backend string) bool {
 }
 
 // bwrapArgv builds the bubblewrap invocation. The whole filesystem is mounted
-// read-only first, then the writable paths are re-bound on top. bubblewrap
-// creates any missing mount targets, so a workspace that lives under /tmp still
-// works after /tmp is replaced with a private tmpfs.
-func bwrapArgv(bwrap, root, work, home, cmd string) []string {
+// read-only first, then the writable paths are re-bound on top. scratch, when
+// non-empty, is bound over /tmp so scratch files persist across commands;
+// otherwise a private tmpfs is used. bubblewrap creates any missing mount
+// targets, so a workspace that lives under /tmp still works after /tmp is
+// replaced.
+func bwrapArgv(bwrap, root, work, home, scratch, cmd string) []string {
 	argv := []string{
 		bwrap,
 		"--ro-bind", "/", "/",
 		"--dev", "/dev",
 		"--proc", "/proc",
-		"--tmpfs", "/tmp",
-		"--bind", root, root,
 	}
+	if scratch != "" {
+		argv = append(argv, "--bind", scratch, "/tmp")
+	} else {
+		argv = append(argv, "--tmpfs", "/tmp")
+	}
+	argv = append(argv, "--bind", root, root)
 	if home != "" {
 		// Bind the persistent home after root so it stays writable even when it
 		// lives underneath the workspace.

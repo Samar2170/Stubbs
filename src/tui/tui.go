@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/atotto/clipboard"
 	"github.com/aymanbagabas/go-osc52/v2"
@@ -347,6 +348,7 @@ type model struct {
 	sp          spinner.Model
 	status      string
 	statusErr   bool
+	statusSince time.Time
 	working     bool
 	doneOk      bool
 	mode        agent.Mode
@@ -394,6 +396,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = string(msg)
 		m.statusErr = false
 		m.working = true
+		m.statusSince = time.Now()
 		return m, nil
 
 	case headerMsg:
@@ -500,6 +503,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 
 	case spinner.TickMsg:
+		if m.working {
+			if m.statusSince.IsZero() {
+				m.statusSince = msg.Time
+			}
+		} else {
+			m.statusSince = time.Time{}
+		}
 		var cmd tea.Cmd
 		m.sp, cmd = m.sp.Update(msg)
 		return m, cmd
@@ -1367,7 +1377,13 @@ func (m *model) busy() bool {
 func (m *model) statusContent() (string, lipgloss.Style) {
 	switch {
 	case m.busy():
-		return m.sp.View() + " " + m.status, m.st.info
+		text := m.sp.View() + " " + m.status
+		if !m.statusSince.IsZero() {
+			if d := time.Since(m.statusSince); d >= time.Second {
+				text += " (" + shortDuration(d) + ")"
+			}
+		}
+		return text, m.st.info
 	case m.status == "":
 		return "ready", m.st.faint
 	case m.done && m.doneOk:
@@ -1437,6 +1453,14 @@ func (m *model) View() string {
 		bottom = append(bottom, box.Render(m.ta.View()))
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, m.header(), m.vp.View(), m.statusLine(), strings.Join(bottom, "\n"))
+}
+
+// shortDuration renders an elapsed duration compactly (e.g. "1m32s", "45s").
+func shortDuration(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	return fmt.Sprintf("%dm%02ds", int(d.Minutes()), int(d.Seconds())%60)
 }
 
 func fieldInt(fields []string, i int) (int, error) {

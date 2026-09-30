@@ -130,3 +130,22 @@ func TestBashSandboxNoBackendError(t *testing.T) {
 		t.Fatalf("err = %v, want errNoSandbox", err)
 	}
 }
+
+func TestBwrapArgvBindsPersistentTmp(t *testing.T) {
+	argv := bwrapArgv("bwrap", "/root", "/root/work", "/home/me", "/root/.stubbs/tmp", "true")
+	joined := strings.Join(argv, " ")
+	if !strings.Contains(joined, "--bind /root/.stubbs/tmp /tmp") {
+		t.Fatalf("expected persistent /tmp bind, got: %s", joined)
+	}
+	if strings.Contains(joined, "--tmpfs /tmp") {
+		t.Fatalf("did not expect tmpfs when scratch is set: %s", joined)
+	}
+}
+
+func TestBwrapArgvFallsBackToTmpfs(t *testing.T) {
+	argv := bwrapArgv("bwrap", "/root", "/root/work", "", "", "true")
+	joined := strings.Join(argv, " ")
+	if !strings.Contains(joined, "--tmpfs /tmp") {
+		t.Fatalf("expected tmpfs fallback, got: %s", joined)
+	}
+}

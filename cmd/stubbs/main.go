@@ -56,6 +56,8 @@ func run() error {
 	configWizF := fs.Bool("config", false, "run the configuration wizard and exit")
 	mapF := fs.Bool("map", false, "regenerate the repository memory map and exit")
 	versionF := fs.Bool("version", false, "print version and exit")
+	envTimeoutF := fs.Int("env-timeout", env.DefaultTimeout, "per-command tool timeout in seconds")
+	llmTimeoutF := fs.Duration("llm-timeout", 90*time.Second, "timeout for a single model request")
 	fs.Parse(os.Args[1:])
 
 	if *versionF {
@@ -147,15 +149,16 @@ func run() error {
 	if memStore != nil {
 		registry.Register(tools.NewMemoryTool(memStore))
 	}
-	client := llm.NewORClient(cfg.APIKey, []string{model}, registry)
-	environ := env.NewLocalEnvironment(env.EnvironmentConfig{WorkingDir: workdir, Timeout: 300}, registry)
+	client := llm.NewORClient(cfg.APIKey, []string{model}, registry, llm.WithTimeout(*llmTimeoutF))
+	environ := env.NewLocalEnvironment(env.EnvironmentConfig{WorkingDir: workdir, Timeout: *envTimeoutF}, registry)
 
 	iCfg := agent.InteractiveConfig{
 		AgentConfig: agent.AgentConfig{
-			StepLimit:  *stepsF,
-			CostLimit:  float32(*costF),
-			WorkingDir: workdir,
-			Memory:     memStore,
+			StepLimit:    *stepsF,
+			CostLimit:    float32(*costF),
+			WorkingDir:   workdir,
+			SystemPrompt: agent.SystemPromptFor(registry.List()),
+			Memory:       memStore,
 		},
 		Mode:             mode,
 		WhitelistActions: *whitelistF,

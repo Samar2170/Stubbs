@@ -164,6 +164,8 @@ func (ia *InteractiveAgent) Run(ctx context.Context, task string) (string, error
 	a.ensureRepoMap(ctx)
 	a.injectMemory(task)
 	defer a.summarizeMemory(ctx)
+	malformedTurns := 0
+	unknownTurns := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return "", err
@@ -205,6 +207,16 @@ func (ia *InteractiveAgent) Run(ctx context.Context, task string) (string, error
 		}
 		ia.ui.Assistant(a.Steps, a.Cost, msg)
 		if len(msg.ToolCalls) == 0 {
+			// Some models put tool calls in the text body instead of the native
+			// field. respond() repairs well-formed markup; if markup remains it
+			// was malformed, so ask the model to try again with real calls.
+			if looksLikeToolMarkup(msg.Content) && malformedTurns < maxMalformedRetries {
+				malformedTurns++
+				if err := a.rejectMalformed(msg.Content); err != nil {
+					return "", err
+				}
+				continue
+			}
 			done, err := ia.finish(msg.Content)
 			if err != nil {
 				cont, rerr := ia.promptErr(err)
@@ -221,6 +233,21 @@ func (ia *InteractiveAgent) Run(ctx context.Context, task string) (string, error
 			}
 			continue
 		}
+		malformedTurns = 0
+		// Reject hallucinated tool names before asking the user to approve a
+		// tool that does not exist. Every call in the step gets a tool response
+		// so the assistant tool_calls stay paired for the next API request.
+		if _, unknown := ia.partitionCalls(msg.ToolCalls); len(unknown) > 0 {
+			unknownTurns++
+			if err := ia.rejectCalls(msg.ToolCalls); err != nil {
+				return "", err
+			}
+			if unknownTurns >= maxMalformedRetries {
+				return "", fmt.Errorf("agent: model repeatedly called unknown tools")
+			}
+			continue
+		}
+		unknownTurns = 0
 		approved, err := ia.confirmCalls(msg.ToolCalls)
 		if err != nil {
 			// TODO: this block is repeated way too much
@@ -304,12 +331,7 @@ func (ia *InteractiveAgent) userExecute(ctx context.Context, cmd string) error {
 	ia.ui.Status("running your command...")
 	out := a.Environment.Execute(ctx, call)
 	ia.ui.Observation(call, out)
-	return a.appendMessage(types.Message{
-		Role:       types.RoleTool,
-		Content:    renderExecution(out),
-		ToolCallID: call.ID,
-		Name:       call.Function.Name,
-	})
+	return a.appendToolResult(call, out)
 }
 
 func marshalCommand(cmd string) string {
@@ -511,6 +533,47 @@ func (ia *InteractiveAgent) confirmCalls(calls []types.ToolCall) (bool, error) {
 			return false, nil
 		}
 	}
+}
+
+// partitionCalls splits calls into those whose tool is registered and those
+// that name a nonexistent tool (a common model hallucination).
+func (ia *InteractiveAgent) partitionCalls(calls []types.ToolCall) (known, unknown []types.ToolCall) {
+	env := ia.Agent.Environment
+	for _, call := range calls {
+		if env != nil && env.Has(call.Function.Name) {
+			known = append(known, call)
+		} else {
+			unknown = append(unknown, call)
+		}
+	}
+	return known, unknown
+}
+
+// rejectCalls answers every call in a step that contained an unknown tool. The
+// unknown ones get an actionable error; the rest are marked not executed so the
+// assistant's tool_calls remain paired with tool responses.
+func (ia *InteractiveAgent) rejectCalls(calls []types.ToolCall) error {
+	a := ia.Agent
+	available := ia.toolNames()
+	for _, call := range calls {
+		var out types.ExecutionOutput
+		if a.Environment == nil || !a.Environment.Has(call.Function.Name) {
+			out.Error = fmt.Sprintf("unknown tool %q; available: %v", call.Function.Name, available)
+		} else {
+			out.Error = fmt.Sprintf("not executed: this step also called an unknown tool; available: %v", available)
+		}
+		if err := a.appendToolResult(call, out); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (ia *InteractiveAgent) toolNames() []string {
+	if ia.Agent == nil || ia.Agent.Environment == nil {
+		return nil
+	}
+	return ia.Agent.Environment.ToolNames()
 }
 
 func (ia *InteractiveAgent) whitelisted(cmd string) bool {

@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"stubbs/src/env"
 	"stubbs/src/llm"
@@ -13,11 +14,43 @@ import (
 
 var SYSTEM_TEMPLATE = "You are a helpful assistant that can interact with a computer."
 
+// maxMalformedRetries bounds how many consecutive turns the agent will spend
+// correcting unparseable or tool-less model output before giving up.
+const maxMalformedRetries = 3
+
+// SystemPromptFor builds the system prompt, listing the tools that are actually
+// registered so the model does not invent names, and forbidding the XML
+// tool-call style some providers emit instead of native function calls.
+func SystemPromptFor(tools []types.Tool) string {
+	names := make([]string, 0, len(tools))
+	for _, t := range tools {
+		if n := t.Name(); n != "" {
+			names = append(names, n)
+		}
+	}
+	sort.Strings(names)
+
+	var b strings.Builder
+	b.WriteString(SYSTEM_TEMPLATE)
+	b.WriteString("\n\nUse the provided function-calling tools to act on the computer; never write tool calls as text, XML, or JSON in your reply.\n")
+	if len(names) > 0 {
+		fmt.Fprintf(&b, "Available tools: %s.\n", strings.Join(names, ", "))
+	}
+	b.WriteString("Only call the tools listed above, with exactly those names. If you need a capability that no tool provides, say so in plain text instead of inventing a tool.")
+	b.WriteString("\nPut throwaway scripts and notes in a scratch directory you create under $HOME (for example $HOME/scratch); do not add temporary *_test.go files to a Go package, and do not rely on /tmp because it is recreated for every command.")
+	return b.String()
+}
+
+// toolMarkupCorrection is fed back to the model when its reply contained
+// tool-call markup the harness could not parse.
+const toolMarkupCorrection = "Your previous reply contained tool-call markup that could not be parsed. Call the provided functions natively, using only the listed tool names."
+
 type AgentConfig struct {
 	StepLimit     int
 	CostLimit     float32
 	WallTimeLimit int
 	WorkingDir    string
+	SystemPrompt  string
 	Memory        *memory.Store
 }
 
@@ -43,7 +76,11 @@ func NewAgent(cfg *AgentConfig, client llm.ModelClient, environ env.Environment,
 	if client == nil {
 		return nil, fmt.Errorf("agent: client cannot be nil")
 	}
-	s, err := newSession(model, SYSTEM_TEMPLATE)
+	sysPrompt := cfg.SystemPrompt
+	if strings.TrimSpace(sysPrompt) == "" {
+		sysPrompt = SYSTEM_TEMPLATE
+	}
+	s, err := newSession(model, sysPrompt)
 	if err != nil {
 		return nil, err
 	}
@@ -73,15 +110,24 @@ func (a *Agent) Run(ctx context.Context, task string) (string, error) {
 	a.injectMemory(task)
 	defer a.summarizeMemory(ctx)
 	var resp string
+	malformed := 0
 	for a.Steps < a.config.StepLimit && (a.config.CostLimit <= 0 || a.Cost <= a.config.CostLimit) {
 		content, err := a.step(ctx)
 		if err != nil {
 			return "", err
 		}
-		if content != "" {
-			resp = content
-			break
+		if content == "" {
+			continue
 		}
+		if looksLikeToolMarkup(content) && malformed < maxMalformedRetries {
+			malformed++
+			if err := a.rejectMalformed(content); err != nil {
+				return "", err
+			}
+			continue
+		}
+		resp = content
+		break
 	}
 	return resp, nil
 }
@@ -187,6 +233,7 @@ func (a *Agent) respond(ctx context.Context) (types.Message, error) {
 	a.Steps++
 	resp, err := a.query(ctx)
 	if err != nil {
+		_ = a.Session.AppendError("model call", err)
 		return types.Message{}, err
 	}
 	if len(resp.Choices) == 0 {
@@ -198,10 +245,45 @@ func (a *Agent) respond(ctx context.Context) (types.Message, error) {
 		Content:   choice.Message.Content,
 		ToolCalls: choice.Message.ToolCalls,
 	}
+	// Repair tool calls some models embed in content instead of the native
+	// tool_calls field.
+	if len(msg.ToolCalls) == 0 && looksLikeToolMarkup(msg.Content) {
+		calls, stripped, ok := parseToolCalls(msg.Content)
+		if ok {
+			msg.ToolCalls = calls
+			msg.Content = stripped
+		} else {
+			_ = a.Session.AppendError("unparseable tool markup", fmt.Errorf("%s", truncate(msg.Content, 200)))
+		}
+	}
 	if err := a.appendMessage(msg); err != nil {
 		return types.Message{}, err
 	}
 	return msg, nil
+}
+
+// appendToolResult records a tool execution in the session log with its
+// structured outcome and appends the matching tool message to the history.
+func (a *Agent) appendToolResult(call types.ToolCall, out types.ExecutionOutput) error {
+	if err := a.Session.AppendToolResult(call, out); err != nil {
+		return fmt.Errorf("append tool result: %w", err)
+	}
+	return nil
+}
+
+// rejectMalformed logs an unparseable assistant reply and feeds a corrective
+// user turn back so the model can retry with native tool calls.
+func (a *Agent) rejectMalformed(content string) error {
+	_ = a.Session.AppendError("malformed assistant output", fmt.Errorf("%s", truncate(content, 200)))
+	return a.appendMessage(types.Message{Role: types.RoleUser, Content: toolMarkupCorrection})
+}
+
+func truncate(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 func (a *Agent) executeRuns(ctx context.Context, calls []types.ToolCall) ([]types.ExecutionOutput, error) {
@@ -210,12 +292,7 @@ func (a *Agent) executeRuns(ctx context.Context, calls []types.ToolCall) ([]type
 		out := a.Environment.Execute(ctx, call)
 		a.captureHeuristic(call, out)
 		outputs = append(outputs, out)
-		if err := a.appendMessage(types.Message{
-			Role:       types.RoleTool,
-			Content:    renderExecution(out),
-			ToolCallID: call.ID,
-			Name:       call.Function.Name,
-		}); err != nil {
+		if err := a.appendToolResult(call, out); err != nil {
 			return outputs, err
 		}
 	}
