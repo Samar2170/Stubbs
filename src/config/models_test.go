@@ -55,6 +55,36 @@ func TestLegacyScalarModelMigrates(t *testing.T) {
 	}
 }
 
+func TestApprovalInWorkdirPreservedAcrossSaveModel(t *testing.T) {
+	isolate(t)
+
+	yaml := "provider: openrouter\nenv: local\ntheme: tokyo\napproval:\n  in_workdir: true\n  tools:\n    file_read: allow\n"
+	if err := os.WriteFile(ProjectConfigFile, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !Load().Approval.InWorkdir {
+		t.Fatal("in_workdir not loaded")
+	}
+
+	if err := SaveModel("someone/model"); err != nil {
+		t.Fatal(err)
+	}
+	if !Load().Approval.InWorkdir {
+		t.Fatal("in_workdir lost after SaveModel")
+	}
+}
+
+func TestInWorkdirMakesConfigCountAsSettings(t *testing.T) {
+	isolate(t)
+
+	if err := os.WriteFile(ProjectConfigFile, []byte("approval:\n  in_workdir: true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !configFileHasSettings() {
+		t.Fatal("in_workdir should count as a configured setting")
+	}
+}
+
 func TestApprovalPreservedAcrossSaveModel(t *testing.T) {
 	isolate(t)
 

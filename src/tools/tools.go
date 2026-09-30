@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -20,6 +21,19 @@ type BashTool struct {
 	Timeout   time.Duration
 	MaxOutput int
 	Dir       string
+	// Confine sandboxes each command so writes are limited to Dir. See
+	// bashSandbox for the guarantees and requirements.
+	Confine bool
+	// SandboxBackend selects the backend ("auto" or "bwrap"); empty means auto.
+	SandboxBackend string
+	// SandboxHome is a host directory used as HOME inside the sandbox so caches
+	// persist. Empty uses a private tmpfs home.
+	SandboxHome string
+	// AllowUnsandboxed runs commands unconfined when Confine is set but no
+	// sandbox backend is available, instead of failing.
+	AllowUnsandboxed bool
+	// LookPath is injectable for tests; defaults to exec.LookPath.
+	LookPath func(string) (string, error)
 }
 
 func NewBashTool() *BashTool {
@@ -73,8 +87,30 @@ func (b *BashTool) Execute(ctx context.Context, args string) types.ExecutionOutp
 	}
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	cmd := exec.CommandContext(runCtx, "bash", "-c", input.Command)
-	cmd.Dir = b.Dir
+
+	argv := []string{"bash", "-c", input.Command}
+	runDir := b.Dir
+	if b.Confine {
+		spec, err := (bashSandbox{
+			Root:             b.Dir,
+			WorkDir:          b.Dir,
+			Backend:          b.SandboxBackend,
+			Home:             b.SandboxHome,
+			AllowUnsandboxed: b.AllowUnsandboxed,
+			LookPath:         b.LookPath,
+		}).Command(input.Command)
+		switch {
+		case err == nil:
+			argv = spec.Argv
+			runDir = spec.Dir
+		case b.AllowUnsandboxed && errors.Is(err, errNoSandbox):
+			// Fall back to running unconfined.
+		default:
+			return types.ExecutionOutput{Error: fmt.Sprintf("bash: %v", err), Code: -1}
+		}
+	}
+	cmd := exec.CommandContext(runCtx, argv[0], argv[1:]...)
+	cmd.Dir = runDir
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
