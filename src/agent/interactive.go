@@ -670,6 +670,7 @@ func (ia *InteractiveAgent) printHelp() {
 	ia.ui.Info("/c — switch to confirm mode (ask before executing LM commands)")
 	ia.ui.Info("/u — switch to human mode (execute commands issued by the user)")
 	ia.ui.Info("/models — browse and switch the active model")
+	ia.ui.Info("/sessions — open a previous session and continue it")
 	ia.ui.Info("/m — expand the input box (multiline editing)")
 	ia.ui.Info("/h — show this help")
 }

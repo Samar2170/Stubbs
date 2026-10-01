@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 )
 
 // dialogKind selects which bottom-sheet modal is active.
@@ -14,15 +15,17 @@ const (
 	dlgConfirm
 	dlgExit
 	dlgModels
+	dlgSessions
 )
 
 // dlgAction describes what picking an option does.
 type dlgAction int
 
 const (
-	dlgResolve dlgAction = iota // resolve the pending prompt with text
-	dlgReject                   // swap to a reject-comment composer
-	dlgNewTask                  // swap to a new-task composer
+	dlgResolve     dlgAction = iota // resolve the pending prompt with text
+	dlgReject                       // swap to a reject-comment composer
+	dlgNewTask                      // swap to a new-task composer
+	dlgOpenSession                  // resume the selected session
 )
 
 type dlgOption struct {
@@ -58,6 +61,44 @@ func newModelsDialog(models []ModelChoice) *dialog {
 	return &dialog{kind: dlgModels, all: opts, options: opts}
 }
 
+// newSessionsDialog builds the /sessions picker. Sessions arrive newest-first
+// from the backend and are shown as "<first message>  ·<age>".
+func newSessionsDialog(sessions []SessionChoice) *dialog {
+	opts := make([]dlgOption, 0, len(sessions))
+	for _, s := range sessions {
+		label := firstLine(strings.TrimSpace(s.FirstMessage))
+		if label == "" {
+			label = "(empty session)"
+		}
+		if s.Messages > 0 {
+			label = fmt.Sprintf("%s  ·%d msgs", label, s.Messages)
+		}
+		if age := shortAge(s.Updated); age != "" {
+			label = fmt.Sprintf("%s  ·%s", label, age)
+		}
+		opts = append(opts, dlgOption{label: label, text: s.ID, action: dlgOpenSession})
+	}
+	return &dialog{kind: dlgSessions, all: opts, options: opts}
+}
+
+// shortAge renders how long ago a session was last active.
+func shortAge(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return "now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd", int(d.Hours()/24))
+	}
+}
+
 // applyFilter narrows the models list to the current filter string.
 func (d *dialog) applyFilter() {
 	f := strings.ToLower(strings.TrimSpace(d.filter))
@@ -80,7 +121,8 @@ func (d *dialog) applyFilter() {
 // visibleOptions returns the slice of options to draw and its offset. The
 // models picker is windowed around the selection so long catalogs stay usable.
 func (d *dialog) visibleOptions() ([]dlgOption, int) {
-	if d.kind != dlgModels || len(d.options) <= maxModelRows {
+	windowed := d.kind == dlgModels || d.kind == dlgSessions
+	if !windowed || len(d.options) <= maxModelRows {
 		return d.options, 0
 	}
 	off := d.selected - maxModelRows/2
@@ -137,6 +179,7 @@ func (d *dialog) render(width int, s styles) string {
 			[2]string{"/h", "this help"},
 			[2]string{"/u /c /y", "human · confirm · yolo mode"},
 			[2]string{"/models", "switch model"},
+			[2]string{"/sessions", "open a previous session"},
 			[2]string{"/remember", "save a memory"},
 			[2]string{"/forget", "delete memories"},
 			[2]string{"/memory", "list memories"},
@@ -158,11 +201,20 @@ func (d *dialog) render(width int, s styles) string {
 			lines = append(lines, s.faint.Render("type to filter"))
 		}
 		lines = append(lines, "")
+	case dlgSessions:
+		lines = append(lines, s.agent.Render("open a session"))
+		if d.filter != "" {
+			lines = append(lines, s.info.Render("filter: "+d.filter))
+		} else {
+			lines = append(lines, s.faint.Render("type to filter · newest first"))
+		}
+		lines = append(lines, "")
 	default: // exit
 		lines = append(lines, s.agent.Render("agent wants to finish"), "")
 	}
+	filterable := d.kind == dlgModels || d.kind == dlgSessions
 	opts, offset := d.visibleOptions()
-	if d.kind == dlgModels && len(d.options) == 0 {
+	if filterable && len(d.options) == 0 {
 		lines = append(lines, s.faint.Render("  no matches"))
 	}
 	for i, o := range opts {
@@ -172,7 +224,7 @@ func (d *dialog) render(width int, s styles) string {
 			lines = append(lines, s.option.Render("  "+o.label))
 		}
 	}
-	if d.kind == dlgModels {
+	if filterable {
 		lines = append(lines, "", s.faint.Render(fmt.Sprintf("%d/%d", min(d.selected+1, len(d.options)), len(d.options))))
 		lines = append(lines, s.faint.Render("↑/↓ move · type to filter · enter select · esc cancel"))
 		return s.dialog.Render(wrapAt(cw).Render(strings.Join(lines, "\n")))

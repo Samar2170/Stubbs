@@ -348,3 +348,31 @@ func TestMenuSelectionResetsOnNewQuery(t *testing.T) {
 		t.Errorf("a changed query should reset the selection, got %d", m.menu.selected)
 	}
 }
+
+func TestSessionsCommandAppearsWhenWired(t *testing.T) {
+	m := memoryModel()
+	for _, o := range m.commands() {
+		if o.name == "/sessions" {
+			t.Fatal("/sessions should be hidden when session handlers are not wired")
+		}
+	}
+	m.app.sessions = &SessionHandlers{}
+	// Only the initial task prompt can open a session.
+	m.pending.kind = inTask
+	var found bool
+	for _, o := range m.commands() {
+		if o.name == "/sessions" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("/sessions should appear at the task prompt once session handlers are wired")
+	}
+	// Agent prompts must not offer it.
+	m.pending.kind = inComment
+	for _, o := range m.commands() {
+		if o.name == "/sessions" {
+			t.Fatal("/sessions should not appear at agent prompts")
+		}
+	}
+}

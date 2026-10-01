@@ -147,15 +147,19 @@ func (m *model) commands() []slashCommand {
 		{name: "/c", desc: "confirm mode"},
 		{name: "/y", desc: "yolo mode"},
 	}
+	if m.app != nil && m.app.sessions != nil && m.pending != nil && m.pending.kind == inTask {
+		cmds = append(cmds, slashCommand{name: "/sessions", desc: "open a previous session"})
+	}
 	if m.app == nil || m.app.memory == nil {
 		return cmds
 	}
-	return append(cmds,
+	cmds = append(cmds,
 		slashCommand{name: "/remember", args: "<text>", desc: "save a memory", takesArg: true},
 		slashCommand{name: "/forget", args: "<id|query>", desc: "delete memories", takesArg: true},
 		slashCommand{name: "/memory", desc: "list memories"},
 		slashCommand{name: "/map", desc: "regenerate repo map"},
 	)
+	return cmds
 }
 
 // syncMenu keeps the popup in step with the composer text. The menu only

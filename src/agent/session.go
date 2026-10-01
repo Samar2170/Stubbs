@@ -27,6 +27,7 @@ type sessionRecord struct {
 	Type       string    `json:"type"`
 	Content    string    `json:"content"`
 	ToolCallID string    `json:"tool_call_id,omitempty"`
+	Name       string    `json:"name,omitempty"`
 	Model      string    `json:"model"`
 }
 
@@ -60,7 +61,7 @@ func (s *Session) Append(msg types.Message) error {
 	defer s.mu.Unlock()
 	s.Messages = append(s.Messages, msg)
 	s.context.AddMessage(msg)
-	rec := sessionRecord{Timestamp: time.Now(), Type: msg.Role, Content: msg.Content, ToolCallID: msg.ToolCallID, Model: s.model}
+	rec := sessionRecord{Timestamp: time.Now(), Type: msg.Role, Content: msg.Content, ToolCallID: msg.ToolCallID, Name: msg.Name, Model: s.model}
 	line, err := json.Marshal(rec)
 	if err != nil {
 		return fmt.Errorf("marshal session record: %w", err)
