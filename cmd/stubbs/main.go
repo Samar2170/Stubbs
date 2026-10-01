@@ -29,6 +29,10 @@ import (
 const (
 	defaultStepLimit = 24
 	defaultCostLimit = 5.0
+	// defaultLLMTimeout caps a single model request. Responses are not
+	// streamed, so the whole body must arrive within this window; keep it
+	// generous or long completions get killed mid-read.
+	defaultLLMTimeout = 5 * time.Minute
 )
 
 func main() {
@@ -57,7 +61,7 @@ func run() error {
 	mapF := fs.Bool("map", false, "regenerate the repository memory map and exit")
 	versionF := fs.Bool("version", false, "print version and exit")
 	envTimeoutF := fs.Int("env-timeout", env.DefaultTimeout, "per-command tool timeout in seconds")
-	llmTimeoutF := fs.Duration("llm-timeout", 90*time.Second, "timeout for a single model request")
+	llmTimeoutF := fs.Duration("llm-timeout", defaultLLMTimeout, "timeout for a single model request (0 disables)")
 	fs.Parse(os.Args[1:])
 
 	if *versionF {

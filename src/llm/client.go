@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"stubbs/src/types"
@@ -225,13 +226,29 @@ func (c *ORClient) complete(ctx context.Context, messages []types.Message, tools
 			}
 			return resp, nil
 		}
-		var apiErr *APIError
-		if !errors.As(err, &apiErr) || !apiErr.Retryable() {
+		if !retryable(ctx, err) {
 			return ORChatResponse{}, err
 		}
 		lastErr = err
 	}
 	return ORChatResponse{}, fmt.Errorf("openrouter: giving up after %d attempts: %w", maxAttempts, lastErr)
+}
+
+// retryable reports whether err is worth another attempt. API errors are
+// retried when the status is transient; transport timeouts (including
+// http.Client.Timeout) are retried too, since a slow provider response is not
+// fatal. A cancelled or expired parent context is never retried: the caller
+// owns that deadline and handles it explicitly.
+func retryable(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Retryable()
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 func (c *ORClient) query(ctx context.Context, model string, messages []types.Message, tools []types.ToolDefinition) (ORChatResponse, error) {
