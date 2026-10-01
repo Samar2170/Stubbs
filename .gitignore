@@ -15,3 +15,6 @@ bench/polyglot/results/
 bench/polyglot/logs/
 bench/polyglot/exercises.jsonl
 __pycache__
+
+plan.md
+step*.md
