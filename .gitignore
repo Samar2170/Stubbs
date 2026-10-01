@@ -18,3 +18,7 @@ __pycache__
 
 # throwaway probe tests created by the agent
 zz_*_test.go
+
+
+plan.md
+step*.md
