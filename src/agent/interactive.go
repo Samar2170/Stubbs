@@ -537,7 +537,7 @@ func (ia *InteractiveAgent) withinWorkdir(call types.ToolCall) bool {
 		return false
 	}
 	switch call.Function.Name {
-	case "file_read", "file_write", "file_edit", "file_list":
+	case "read", "write", "edit", "list":
 		return true
 	case "bash":
 		return ia.cfg.BashConfined
@@ -563,14 +563,14 @@ func CommandOf(call types.ToolCall) string {
 // prompts and whitelist matching do not have to display raw argument JSON.
 func fileCommandOf(call types.ToolCall) string {
 	switch call.Function.Name {
-	case "file_read":
+	case "read":
 		var a struct {
 			FilePath string `json:"file_path"`
 		}
 		if json.Unmarshal([]byte(call.Function.Arguments), &a) == nil {
 			return "read " + a.FilePath
 		}
-	case "file_write":
+	case "write":
 		var a struct {
 			FilePath string `json:"file_path"`
 			Content  string `json:"content"`
@@ -583,14 +583,14 @@ func fileCommandOf(call types.ToolCall) string {
 			}
 			return fmt.Sprintf("%s %s (%d bytes)", verb, a.FilePath, len(a.Content))
 		}
-	case "file_edit":
+	case "edit":
 		var a struct {
 			FilePath string `json:"file_path"`
 		}
 		if json.Unmarshal([]byte(call.Function.Arguments), &a) == nil {
 			return "edit " + a.FilePath
 		}
-	case "file_list":
+	case "list":
 		var a struct {
 			Path      string `json:"path"`
 			Recursive bool   `json:"recursive"`
@@ -605,7 +605,7 @@ func fileCommandOf(call types.ToolCall) string {
 			}
 			return "list " + p
 		}
-	case "web_fetch":
+	case "webfetch":
 		var a struct {
 			URL string `json:"url"`
 		}

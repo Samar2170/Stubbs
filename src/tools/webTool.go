@@ -38,7 +38,7 @@ func NewWebFetchTool() *WebFetchTool {
 	}
 }
 
-func (t *WebFetchTool) Name() string { return "web_fetch" }
+func (t *WebFetchTool) Name() string { return "webfetch" }
 
 func (t *WebFetchTool) Description() string {
 	return "Fetch a web page over HTTP(S) and return its contents as text. " +
@@ -65,18 +65,18 @@ type webFetchArgs struct {
 func (t *WebFetchTool) Execute(ctx context.Context, args string) types.ExecutionOutput {
 	var a webFetchArgs
 	if err := json.Unmarshal([]byte(args), &a); err != nil {
-		return types.ExecutionOutput{Error: fmt.Sprintf("web_fetch: invalid arguments: %v", err), Code: -1}
+		return types.ExecutionOutput{Error: fmt.Sprintf("webfetch: invalid arguments: %v", err), Code: -1}
 	}
 	raw := strings.TrimSpace(a.URL)
 	u, err := url.Parse(raw)
 	if err != nil {
-		return types.ExecutionOutput{Error: fmt.Sprintf("web_fetch: invalid URL: %v", err), Code: -1}
+		return types.ExecutionOutput{Error: fmt.Sprintf("webfetch: invalid URL: %v", err), Code: -1}
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return types.ExecutionOutput{Error: fmt.Sprintf("web_fetch: unsupported scheme %q (want http or https)", u.Scheme), Code: -1}
+		return types.ExecutionOutput{Error: fmt.Sprintf("webfetch: unsupported scheme %q (want http or https)", u.Scheme), Code: -1}
 	}
 	if u.Host == "" {
-		return types.ExecutionOutput{Error: "web_fetch: URL has no host", Code: -1}
+		return types.ExecutionOutput{Error: "webfetch: URL has no host", Code: -1}
 	}
 
 	timeout := t.Timeout
@@ -88,7 +88,7 @@ func (t *WebFetchTool) Execute(ctx context.Context, args string) types.Execution
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return types.ExecutionOutput{Error: fmt.Sprintf("web_fetch: build request: %v", err), Code: -1}
+		return types.ExecutionOutput{Error: fmt.Sprintf("webfetch: build request: %v", err), Code: -1}
 	}
 	ua := t.UserAgent
 	if ua == "" {
@@ -99,14 +99,14 @@ func (t *WebFetchTool) Execute(ctx context.Context, args string) types.Execution
 
 	resp, err := t.client().Do(req)
 	if err != nil {
-		return types.ExecutionOutput{Error: fmt.Sprintf("web_fetch: %v", err), Code: -1}
+		return types.ExecutionOutput{Error: fmt.Sprintf("webfetch: %v", err), Code: -1}
 	}
 	defer resp.Body.Close()
 
 	max := t.maxOutput()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, int64(max)+1))
 	if err != nil {
-		return types.ExecutionOutput{Error: fmt.Sprintf("web_fetch: read body: %v", err), Code: -1}
+		return types.ExecutionOutput{Error: fmt.Sprintf("webfetch: read body: %v", err), Code: -1}
 	}
 	truncated := len(body) > max
 	if truncated {
@@ -125,7 +125,7 @@ func (t *WebFetchTool) Execute(ctx context.Context, args string) types.Execution
 
 	out := types.ExecutionOutput{Output: text}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		out.Error = fmt.Sprintf("web_fetch: HTTP %s", resp.Status)
+		out.Error = fmt.Sprintf("webfetch: HTTP %s", resp.Status)
 		out.Code = -1
 	}
 	return out
