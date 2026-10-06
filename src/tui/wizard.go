@@ -87,7 +87,8 @@ func (w wizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return w, tea.Quit
 		case "enter":
 			value := strings.TrimSpace(w.input.Value())
-			if !w.valid(value) {
+			if ok, msg := w.valid(value); !ok {
+				w.errMsg = msg
 				return w, nil
 			}
 			w.values[w.step] = value
@@ -105,25 +106,25 @@ func (w wizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return w, cmd
 }
 
-func (w wizard) valid(value string) bool {
+// valid reports whether value is acceptable for the current step, along with
+// an error message to display when it is not. It must not mutate the wizard:
+// it is called on the copy held by Update.
+func (w wizard) valid(value string) (bool, string) {
 	switch w.step {
 	case 0:
 		if value == "" && !w.hasKey {
-			w.errMsg = "API key is required (or set STUBBS_API_KEY / OPENROUTER_API_KEY)."
-			return false
+			return false, "API key is required (or set STUBBS_API_KEY / OPENROUTER_API_KEY)."
 		}
 	case 1:
 		if value == "" {
-			w.errMsg = "Model is required."
-			return false
+			return false, "Model is required."
 		}
 	case 2:
 		if value == "" {
-			w.errMsg = "Environment is required."
-			return false
+			return false, "Environment is required."
 		}
 	}
-	return true
+	return true, ""
 }
 
 func (w wizard) View() string {

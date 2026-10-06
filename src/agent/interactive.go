@@ -140,7 +140,7 @@ func (ia *InteractiveAgent) SetModel(model string) {
 	if model == "" {
 		return
 	}
-	if ia.Agent.Model == model {
+	if ia.ModelName() == model {
 		ia.ui.Info("Already using %s.", model)
 		return
 	}
@@ -163,7 +163,6 @@ func (ia *InteractiveAgent) Run(ctx context.Context, task string) (string, error
 	}
 	a.ensureRepoMap(ctx)
 	a.injectMemory(task)
-	defer a.summarizeMemory(ctx)
 	malformedTurns := 0
 	unknownTurns := 0
 	for {

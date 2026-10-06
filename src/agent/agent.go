@@ -10,6 +10,7 @@ import (
 	"stubbs/src/llm"
 	"stubbs/src/memory"
 	"stubbs/src/types"
+	"sync"
 	"time"
 )
 
@@ -79,7 +80,8 @@ type AgentConfig struct {
 
 type Agent struct {
 	config      *AgentConfig
-	Model       string
+	model       string
+	modelMu     sync.RWMutex
 	Tools       []types.Tool
 	ModelClient llm.ModelClient
 	StartTime   time.Time
@@ -117,7 +119,7 @@ func NewAgent(cfg *AgentConfig, client llm.ModelClient, environ env.Environment,
 	}
 	return &Agent{
 		config:      cfg,
-		Model:       model,
+		model:       model,
 		ModelClient: client,
 		Environment: environ,
 		StartTime:   time.Now(),
@@ -163,7 +165,6 @@ func (a *Agent) Run(ctx context.Context, task string) (string, error) {
 	}
 	a.ensureRepoMap(ctx)
 	a.injectMemory(task)
-	defer a.summarizeMemory(ctx)
 	var resp string
 	malformed := 0
 	for a.Steps < a.config.StepLimit && (a.config.CostLimit <= 0 || a.Cost <= a.config.CostLimit) {
@@ -203,16 +204,34 @@ func (a *Agent) ResumeSession(s *Session) {
 	a.Session = s
 }
 
+// ModelName returns the active model. Safe to call concurrently with SetModel.
+func (a *Agent) ModelName() string {
+	if a == nil {
+		return ""
+	}
+	a.modelMu.RLock()
+	defer a.modelMu.RUnlock()
+	return a.model
+}
+
 // SetModel switches the model used for subsequent requests and records the
 // change on the session. It is a no-op when the model is already active.
 func (a *Agent) SetModel(model string) {
-	if a == nil || model == "" || a.Model == model {
+	if a == nil || model == "" {
+		return
+	}
+	a.modelMu.Lock()
+	changed := a.model != model
+	if changed {
+		a.model = model
+	}
+	a.modelMu.Unlock()
+	if !changed {
 		return
 	}
 	if sw, ok := a.ModelClient.(interface{ SetModel(string) }); ok {
 		sw.SetModel(model)
 	}
-	a.Model = model
 	if a.Session != nil {
 		a.Session.SetModel(model)
 	}

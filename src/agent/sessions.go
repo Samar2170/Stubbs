@@ -118,18 +118,23 @@ func sessionIDFromPath(path string) string {
 }
 
 // LoadSession reopens a persisted session log for appending and reconstructs
-// its messages. The returned slice includes the system prompt so callers can
-// rebuild the transcript.
+// its messages. systemPrompt is the system prompt to resume with (typically
+// SystemPromptFor of the current tools); the log does not persist it. The
+// returned slice includes the system prompt so callers can rebuild the
+// transcript.
 //
 // The JSONL log does not persist tool-call arguments, so a tool record cannot
 // be paired with the assistant call that produced it. To keep the resumed
 // conversation valid for the model, only plain user and non-empty assistant
 // text is replayed into the context; tool records remain in Messages for
 // display.
-func LoadSession(model, id string) (*Session, []types.Message, error) {
+func LoadSession(model, id, systemPrompt string) (*Session, []types.Message, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return nil, nil, fmt.Errorf("session: empty id")
+	}
+	if strings.TrimSpace(systemPrompt) == "" {
+		systemPrompt = SYSTEM_TEMPLATE
 	}
 	path := sessionPath(id)
 	f, err := os.Open(path)
@@ -148,9 +153,9 @@ func LoadSession(model, id string) (*Session, []types.Message, error) {
 
 	s := &Session{
 		Id:       uint(uid),
-		Messages: []types.Message{{Role: types.RoleSystem, Content: SYSTEM_TEMPLATE}},
+		Messages: []types.Message{{Role: types.RoleSystem, Content: systemPrompt}},
 		model:    model,
-		context:  NewContext(SYSTEM_TEMPLATE),
+		context:  NewContext(systemPrompt),
 	}
 	display := make([]types.Message, 0, len(records)+1)
 	display = append(display, s.Messages[0])

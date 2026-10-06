@@ -80,7 +80,7 @@ func TestSummarizeMemoryAddsEntries(t *testing.T) {
 			{Role: types.RoleAssistant, Content: strings.Repeat("done, tests pass. ", 40)},
 		}},
 	}
-	a.summarizeMemory(context.Background())
+	a.SummarizeMemory(context.Background())
 	if !fc.called {
 		t.Fatal("completer was not called")
 	}
@@ -103,7 +103,7 @@ func TestSummarizeMemoryDisabled(t *testing.T) {
 			{Role: types.RoleUser, Content: strings.Repeat("x ", 500)},
 		}},
 	}
-	a.summarizeMemory(context.Background())
+	a.SummarizeMemory(context.Background())
 	if fc.called {
 		t.Fatal("model should not be called when auto-summarize is disabled")
 	}
@@ -120,7 +120,7 @@ func TestSummarizeMemorySkipsTinySessions(t *testing.T) {
 		ModelClient: fc,
 		Session:     &Session{Messages: []types.Message{{Role: types.RoleUser, Content: "hi"}}},
 	}
-	a.summarizeMemory(context.Background())
+	a.SummarizeMemory(context.Background())
 	if fc.called {
 		t.Fatal("tiny sessions should not trigger summarization")
 	}

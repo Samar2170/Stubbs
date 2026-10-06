@@ -33,6 +33,9 @@ const (
 	// streamed, so the whole body must arrive within this window; keep it
 	// generous or long completions get killed mid-read.
 	defaultLLMTimeout = 5 * time.Minute
+	// summaryGrace is how long a clean run waits for its background memory
+	// summary to persist before the process exits. It never delays the UI.
+	summaryGrace = 5 * time.Second
 )
 
 func main() {
@@ -219,7 +222,7 @@ func run() error {
 			return out, nil
 		},
 		Open: func(id string) ([]types.Message, error) {
-			session, msgs, err := agent.LoadSession(ia.Model, id)
+			session, msgs, err := agent.LoadSession(ia.ModelName(), id, agent.SystemPromptFor(toolNames))
 			if err != nil {
 				return nil, err
 			}
@@ -297,6 +300,7 @@ func run() error {
 
 	var (
 		wg     sync.WaitGroup
+		bg     sync.WaitGroup
 		out    string
 		runErr error
 	)
@@ -328,12 +332,29 @@ func run() error {
 		if *outputF != "" {
 			writeRun(*outputF, ia, out, runErr)
 		}
+		// Summarize only a clean run, and off the critical path: the UI has
+		// already received its completion message.
+		if runErr == nil {
+			bg.Add(1)
+			go func() {
+				defer bg.Done()
+				ia.SummarizeMemory(context.Background())
+			}()
+		}
 	}()
 
 	tuiErr := app.Run()
 	stop()
 	wg.Wait()
 	printSummary(ia, runErr)
+	// Give a clean run's background summary a short grace period to persist
+	// before the process exits; a quick quit never blocks the UI.
+	summaryDone := make(chan struct{})
+	go func() { bg.Wait(); close(summaryDone) }()
+	select {
+	case <-summaryDone:
+	case <-time.After(summaryGrace):
+	}
 	// A user interrupt (ctrl-c delivered as SIGINT) or a killed program is a
 	// normal way to leave the TUI, not an error.
 	if tuiErr != nil && !errors.Is(tuiErr, tea.ErrInterrupted) && !errors.Is(tuiErr, tea.ErrProgramKilled) {
@@ -388,7 +409,7 @@ func writeRun(path string, a *agent.InteractiveAgent, submission string, runErr 
 		Messages         []types.Message `json:"messages"`
 	}{
 		TrajectoryFormat: "stubbs-trajectory-v1",
-		Model:            a.Model,
+		Model:            a.ModelName(),
 		Steps:            a.Steps,
 		ModelCalls:       a.ModelCalls,
 		Cost:             a.Cost,

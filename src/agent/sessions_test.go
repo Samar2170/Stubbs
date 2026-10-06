@@ -122,7 +122,7 @@ func TestLoadSessionRestoresContextAndAppends(t *testing.T) {
 		{Timestamp: ts.Add(3 * time.Second), Type: types.RoleTool, Content: "tool out", ToolCallID: "x", Name: "bash", Model: "m"},
 	})
 
-	s, msgs, err := LoadSession("m2", "12345")
+	s, msgs, err := LoadSession("m2", "12345", SYSTEM_TEMPLATE)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +169,7 @@ func TestLoadSessionMissingFile(t *testing.T) {
 	orig := config.SessionsDir
 	config.SessionsDir = dir
 	t.Cleanup(func() { config.SessionsDir = orig })
-	if _, _, err := LoadSession("m", "nope"); err == nil {
+	if _, _, err := LoadSession("m", "nope", SYSTEM_TEMPLATE); err == nil {
 		t.Fatal("missing session should error")
 	}
 }
@@ -182,7 +182,7 @@ func TestLoadSessionBadID(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "session_abc.jsonl"), []byte("{}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := LoadSession("m", "abc"); err == nil {
+	if _, _, err := LoadSession("m", "abc", SYSTEM_TEMPLATE); err == nil {
 		t.Fatal("non-numeric id should error")
 	}
 }

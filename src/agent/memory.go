@@ -30,12 +30,20 @@ type textCompleter interface {
 	Complete(context.Context, []types.Message) (llm.ORChatResponse, error)
 }
 
-func (a *Agent) summarizeMemory(ctx context.Context) {
+// SummarizeMemory distils the active session into persistent memory entries.
+// It is not run automatically: callers invoke it only for runs that finished
+// cleanly, and off the critical path, so completion is never delayed. The
+// passed context bounds the (otherwise fixed timeout) summary call and should
+// stay alive until the summary has been written.
+func (a *Agent) SummarizeMemory(ctx context.Context) {
 	if a == nil || a.Memory == nil || a.Session == nil || a.ModelClient == nil {
 		return
 	}
 	if !a.Memory.Options().AutoSummarize {
 		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	transcript := redactSecrets(renderTranscript(a.Session.History()))
 	if estimateTokens(transcript) < memoryMinimumTokens {
@@ -49,7 +57,7 @@ func (a *Agent) summarizeMemory(ctx context.Context) {
 			a.existingMemory(), transcript)},
 	}
 
-	cctx, cancel := context.WithTimeout(context.Background(), memorySummaryTimeout)
+	cctx, cancel := context.WithTimeout(ctx, memorySummaryTimeout)
 	defer cancel()
 
 	content, err := a.completeText(cctx, req)

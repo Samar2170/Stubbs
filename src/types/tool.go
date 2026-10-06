@@ -3,6 +3,7 @@ package types
 import (
 	"context"
 	"encoding/json"
+	"sort"
 	"time"
 )
 
@@ -53,5 +54,8 @@ func (r *Registry) List() []Tool {
 	for _, tool := range r.tools {
 		tools = append(tools, tool)
 	}
+	// Map iteration order is random; sort by name so the tool definitions sent
+	// to the model are stable across requests (prompt-cache hits, reproducibility).
+	sort.Slice(tools, func(i, j int) bool { return tools[i].Name() < tools[j].Name() })
 	return tools
 }
