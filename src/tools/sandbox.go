@@ -96,7 +96,16 @@ func (s bashSandbox) Command(cmd string) (commandSpec, error) {
 				return commandSpec{}, fmt.Errorf("create sandbox home %s: %w", home, err)
 			}
 		}
-		return commandSpec{Argv: bwrapArgv(bwrap, root, work, home, cmd), Dir: work, Sandboxed: true}, nil
+		// Point TMPDIR at a persistent scratch dir under the sandbox home so
+		// files survive across commands. /tmp itself stays an ephemeral tmpfs.
+		tmpdir := ""
+		if home != "" {
+			tmpdir = filepath.Join(home, "scratch")
+			if err := os.MkdirAll(tmpdir, 0o755); err != nil {
+				tmpdir = ""
+			}
+		}
+		return commandSpec{Argv: bwrapArgv(bwrap, root, work, home, tmpdir, cmd), Dir: work, Sandboxed: true}, nil
 	default:
 		return commandSpec{}, fmt.Errorf("unknown bash sandbox backend %q", backend)
 	}
@@ -114,10 +123,12 @@ func SandboxAvailable(backend string) bool {
 }
 
 // bwrapArgv builds the bubblewrap invocation. The whole filesystem is mounted
-// read-only first, then the writable paths are re-bound on top. bubblewrap
-// creates any missing mount targets, so a workspace that lives under /tmp still
-// works after /tmp is replaced with a private tmpfs.
-func bwrapArgv(bwrap, root, work, home, cmd string) []string {
+// read-only first, then the writable paths are re-bound on top. tmpdir, when
+// non-empty, becomes the sandbox's TMPDIR so scratch files persist across
+// commands while /tmp stays a private tmpfs. bubblewrap creates any missing
+// mount targets, so a workspace that lives under /tmp still works after /tmp is
+// replaced.
+func bwrapArgv(bwrap, root, work, home, tmpdir, cmd string) []string {
 	argv := []string{
 		bwrap,
 		"--ro-bind", "/", "/",
@@ -132,6 +143,9 @@ func bwrapArgv(bwrap, root, work, home, cmd string) []string {
 		argv = append(argv, "--bind", home, home, "--setenv", "HOME", home)
 	} else {
 		argv = append(argv, "--dir", sandboxHome, "--setenv", "HOME", sandboxHome)
+	}
+	if tmpdir != "" {
+		argv = append(argv, "--setenv", "TMPDIR", tmpdir)
 	}
 	argv = append(argv,
 		"--unshare-pid",

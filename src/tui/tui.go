@@ -377,6 +377,7 @@ type model struct {
 	sp          spinner.Model
 	status      string
 	statusErr   bool
+	statusSince time.Time
 	working     bool
 	doneOk      bool
 	mode        agent.Mode
@@ -424,6 +425,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = string(msg)
 		m.statusErr = false
 		m.working = true
+		m.statusSince = time.Now()
 		return m, nil
 
 	case headerMsg:
@@ -560,6 +562,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 
 	case spinner.TickMsg:
+		if m.working {
+			if m.statusSince.IsZero() {
+				m.statusSince = msg.Time
+			}
+		} else {
+			m.statusSince = time.Time{}
+		}
 		var cmd tea.Cmd
 		m.sp, cmd = m.sp.Update(msg)
 		return m, cmd
@@ -570,6 +579,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.MouseMsg:
+		// A modal owns the mouse: the wheel pages the confirm dialog's
+		// command list rather than scrolling the transcript behind it.
+		if m.dlg != nil {
+			if d, ok := m.wheelConfirm(msg); ok {
+				return m, d
+			}
+			return m, nil
+		}
 		var cmd tea.Cmd
 		m.vp, cmd = m.vp.Update(msg)
 		if cp := m.handleMouse(msg); cp != nil {
@@ -595,6 +612,26 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.stick = false // the user scrolled up; stop auto-follow
 	}
 	return m, tea.Batch(cmds...)
+}
+
+// wheelConfirm maps a wheel event over the confirm dialog to a viewport page.
+// The ok result is false when the modal is not a scrollable confirm dialog,
+// so the caller can swallow the event without touching the transcript.
+func (m *model) wheelConfirm(msg tea.MouseMsg) (tea.Cmd, bool) {
+	if msg.Action != tea.MouseActionPress || m.dlg == nil || m.dlg.kind != dlgConfirm {
+		return nil, false
+	}
+	var delta int
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		delta = -1
+	case tea.MouseButtonWheelDown:
+		delta = 1
+	default:
+		return nil, false
+	}
+	cmd, _ := m.scrollConfirm(delta)
+	return cmd, true
 }
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -744,11 +781,48 @@ func (m *model) handleDialogKey(key string) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "up", "k":
+		// In the confirm dialog a long command owns the arrow keys: they
+		// page the command viewport instead of moving the option list, so
+		// every line of a huge command stays reachable. The options are two
+		// rows away, so Ctrl+P/Ctrl+N still cycle them.
+		if n, handled := m.scrollConfirm(-1); handled {
+			return m, n
+		}
 		d.selected = (d.selected + len(d.options) - 1) % len(d.options)
 		return m, nil
 
 	case "down", "j", "tab":
+		if n, handled := m.scrollConfirm(1); handled {
+			return m, n
+		}
 		d.selected = (d.selected + 1) % len(d.options)
+		return m, nil
+
+	case "ctrl+p":
+		d.selected = (d.selected + len(d.options) - 1) % len(d.options)
+		return m, nil
+
+	case "ctrl+n":
+		d.selected = (d.selected + 1) % len(d.options)
+		return m, nil
+
+	case "pgup", "ctrl+b":
+		if n, handled := m.scrollConfirm(-m.dlg.confirmPage()); handled {
+			return m, n
+		}
+		return m, nil
+
+	case "pgdown", "ctrl+f":
+		if n, handled := m.scrollConfirm(m.dlg.confirmPage()); handled {
+			return m, n
+		}
+		return m, nil
+
+	case "home":
+		if d.kind == dlgConfirm && d.confirmScrollable(m.w) {
+			d.scroll, d.selected = 0, 0
+			return m, nil
+		}
 		return m, nil
 
 	case "enter":
@@ -786,6 +860,20 @@ func (m *model) handleDialogKey(key string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	return m, nil // the modal swallows everything else
+}
+
+// scrollConfirm pages the confirm dialog's command viewport by delta lines.
+// It returns a no-op command and true when the key was consumed, so the key
+// handler knows not to also move the option selection. Scrolling is only
+// claimed once the commands actually overflow the window; a short approval
+// keeps the plain option-list navigation.
+func (m *model) scrollConfirm(delta int) (tea.Cmd, bool) {
+	d := m.dlg
+	if d == nil || d.kind != dlgConfirm || !d.confirmScrollable(m.w) {
+		return nil, false
+	}
+	d.pageCommands(delta, m.w, m.st)
+	return nil, true
 }
 
 func (m *model) pickDialogOption() tea.Cmd {
@@ -1313,6 +1401,7 @@ func (m *model) layout() {
 	for i := 0; i < 8; i++ {
 		m.statusRows, m.pendingRows = statusWant, pendingWant
 		m.ta.SetHeight(m.inputH)
+		m.budgetDialog()
 		over := m.usedRows() - (m.h - 1)
 		if over <= 0 {
 			break
@@ -1338,6 +1427,7 @@ func (m *model) layout() {
 	}
 	m.statusRows, m.pendingRows = statusWant, pendingWant
 	m.ta.SetHeight(m.inputH)
+	m.budgetDialog()
 	// Only a change of transcript width needs the (expensive) block re-render;
 	// height-only changes just resize the viewport.
 	if m.vp.Width != m.w {
@@ -1345,6 +1435,21 @@ func (m *model) layout() {
 	}
 	m.vp.Width = m.w
 	m.vp.Height = max(m.h-m.usedRows(), 1)
+}
+
+// budgetDialog tells the modal how many rows the terminal can spare. The
+// confirm dialog uses the budget to window a long approval's command list
+// instead of letting the sheet grow until the transcript is pushed off
+// screen. It is called from layout() once the header and status rows are
+// known, and again after those rows are trimmed, so the sheet tracks the
+// space that is actually free.
+func (m *model) budgetDialog() {
+	if m.dlg == nil {
+		return
+	}
+	// Reserve one row for the transcript viewport (its floor in usedRows), so
+	// the sheet plus header and status can never exceed h - 1.
+	m.dlg.resize(max(m.h-max(m.headerH, 1)-max(m.statusRows, 1)-1, 1))
 }
 
 // desiredInputH is the composer height needed to show all of its content.
@@ -1512,7 +1617,13 @@ func (m *model) busy() bool {
 func (m *model) statusContent() (string, lipgloss.Style) {
 	switch {
 	case m.busy():
-		return m.sp.View() + " " + m.status, m.st.info
+		text := m.sp.View() + " " + m.status
+		if !m.statusSince.IsZero() {
+			if d := time.Since(m.statusSince); d >= time.Second {
+				text += " (" + shortDuration(d) + ")"
+			}
+		}
+		return text, m.st.info
 	case m.status == "":
 		return "ready", m.st.faint
 	case m.done && m.doneOk:
@@ -1582,6 +1693,14 @@ func (m *model) View() string {
 		bottom = append(bottom, box.Render(m.ta.View()))
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, m.header(), m.vp.View(), m.statusLine(), strings.Join(bottom, "\n"))
+}
+
+// shortDuration renders an elapsed duration compactly (e.g. "1m32s", "45s").
+func shortDuration(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	return fmt.Sprintf("%dm%02ds", int(d.Minutes()), int(d.Seconds())%60)
 }
 
 func fieldInt(fields []string, i int) (int, error) {

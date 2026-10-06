@@ -164,6 +164,8 @@ func (ia *InteractiveAgent) Run(ctx context.Context, task string) (string, error
 	a.ensureRepoMap(ctx)
 	a.injectMemory(task)
 	defer a.summarizeMemory(ctx)
+	malformedTurns := 0
+	unknownTurns := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return "", err
@@ -193,7 +195,7 @@ func (ia *InteractiveAgent) Run(ctx context.Context, task string) (string, error
 				continue
 			}
 		}
-		msg, err := ia.modelStep(ctx)
+		mr, err := ia.modelStep(ctx)
 		if err != nil {
 			if ia.takeInterrupt() {
 				if cerr := ia.interruptComment(); cerr != nil {
@@ -203,8 +205,23 @@ func (ia *InteractiveAgent) Run(ctx context.Context, task string) (string, error
 			}
 			return "", err
 		}
+		msg := mr.msg
+		calls := msg.ToolCalls
+		if a.protocol == protocolText {
+			calls = mr.textCalls
+		}
 		ia.ui.Assistant(a.Steps, a.Cost, msg)
-		if len(msg.ToolCalls) == 0 {
+		if len(calls) == 0 {
+			// A reply with unparseable tool markup is not a final answer; ask
+			// the model to retry with the correct format.
+			failed := mr.parseFailed || looksLikeToolMarkup(msg.Content)
+			if failed && malformedTurns < maxMalformedRetries {
+				malformedTurns++
+				if err := a.rejectMalformed(msg.Content); err != nil {
+					return "", err
+				}
+				continue
+			}
 			done, err := ia.finish(msg.Content)
 			if err != nil {
 				cont, rerr := ia.promptErr(err)
@@ -221,7 +238,28 @@ func (ia *InteractiveAgent) Run(ctx context.Context, task string) (string, error
 			}
 			continue
 		}
-		approved, err := ia.confirmCalls(msg.ToolCalls)
+		malformedTurns = 0
+		// Reject hallucinated tool names before asking the user to approve a
+		// tool that does not exist. Valid calls in the same step still run.
+		known, unknown := ia.partitionCalls(calls)
+		if len(unknown) > 0 {
+			unknownTurns++
+			if err := ia.rejectCalls(unknown); err != nil {
+				return "", err
+			}
+			if len(known) == 0 && unknownTurns >= maxMalformedRetries {
+				return "", fmt.Errorf("agent: model repeatedly called unknown tools")
+			}
+		} else {
+			unknownTurns = 0
+		}
+		if len(known) == 0 {
+			if err := ia.maybeComment(); err != nil {
+				return "", err
+			}
+			continue
+		}
+		approved, err := ia.confirmCalls(known)
 		if err != nil {
 			// TODO: this block is repeated way too much
 			cont, rerr := ia.promptErr(err)
@@ -236,18 +274,18 @@ func (ia *InteractiveAgent) Run(ctx context.Context, task string) (string, error
 		if !approved {
 			continue
 		}
-		ia.ui.Status(fmt.Sprintf("running %s...", plural(len(msg.ToolCalls), "command")))
+		ia.ui.Status(fmt.Sprintf("running %s...", plural(len(known), "command")))
 		// Register a cancel for tool execution too, so ESC/ctrl-c can stop a
 		// long-running command instead of leaving the UI apparently frozen.
 		runCtx, cancelRuns := context.WithCancel(ctx)
 		ia.setStepCancel(cancelRuns)
-		outputs, err := a.executeRuns(runCtx, msg.ToolCalls)
+		outputs, err := a.executeRuns(runCtx, known)
 		ia.setStepCancel(nil)
 		cancelRuns()
 		if err != nil {
 			return "", err
 		}
-		for i, call := range msg.ToolCalls {
+		for i, call := range known {
 			ia.ui.Observation(call, outputs[i])
 		}
 		if err := ia.maybeComment(); err != nil {
@@ -257,27 +295,30 @@ func (ia *InteractiveAgent) Run(ctx context.Context, task string) (string, error
 
 }
 
-func (ia *InteractiveAgent) modelStep(ctx context.Context) (types.Message, error) {
+func (ia *InteractiveAgent) modelStep(ctx context.Context) (modelResponse, error) {
 	for {
 		ia.ui.Status("waiting for LLM...")
 		sctx, cancel := context.WithCancel(ctx)
 		ia.setStepCancel(cancel)
-		msg, err := ia.Agent.respond(sctx)
+		mr, err := ia.Agent.respond(sctx)
 		cancel()
 		ia.setStepCancel(nil)
+		if errors.Is(err, errRetryTurn) {
+			continue
+		}
 		if err == nil {
-			return msg, nil
+			return mr, nil
 		}
 		if ctx.Err() != nil {
-			return types.Message{}, ctx.Err()
+			return modelResponse{}, ctx.Err()
 		}
 		if ia.takeInterrupt() {
 			if cerr := ia.interruptComment(); cerr != nil {
-				return types.Message{}, cerr
+				return modelResponse{}, cerr
 			}
 			continue
 		}
-		return types.Message{}, err
+		return modelResponse{}, err
 	}
 }
 
@@ -304,12 +345,7 @@ func (ia *InteractiveAgent) userExecute(ctx context.Context, cmd string) error {
 	ia.ui.Status("running your command...")
 	out := a.Environment.Execute(ctx, call)
 	ia.ui.Observation(call, out)
-	return a.appendMessage(types.Message{
-		Role:       types.RoleTool,
-		Content:    renderExecution(out),
-		ToolCallID: call.ID,
-		Name:       call.Function.Name,
-	})
+	return a.appendToolResult(call, out)
 }
 
 func marshalCommand(cmd string) string {
@@ -511,6 +547,43 @@ func (ia *InteractiveAgent) confirmCalls(calls []types.ToolCall) (bool, error) {
 			return false, nil
 		}
 	}
+}
+
+// partitionCalls splits calls into those whose tool is registered and those
+// that name a nonexistent tool (a common model hallucination).
+func (ia *InteractiveAgent) partitionCalls(calls []types.ToolCall) (known, unknown []types.ToolCall) {
+	for _, call := range calls {
+		if ia.Agent.hasTool(call.Function.Name) {
+			known = append(known, call)
+		} else {
+			unknown = append(unknown, call)
+		}
+	}
+	return known, unknown
+}
+
+// rejectCalls reports unknown tool names back to the model. In the native
+// protocol each call gets a matching tool response; in the text protocol the
+// feedback is a single user turn, since there is no call/response pairing.
+func (ia *InteractiveAgent) rejectCalls(calls []types.ToolCall) error {
+	a := ia.Agent
+	available := a.toolNameList()
+	if a.protocol == protocolText {
+		var b strings.Builder
+		for _, call := range calls {
+			fmt.Fprintf(&b, "Unknown tool %q. ", call.Function.Name)
+		}
+		fmt.Fprintf(&b, "Available tools: %v.", available)
+		return a.appendMessage(types.Message{Role: types.RoleUser, Content: b.String()})
+	}
+	availableErr := fmt.Sprintf("unknown tool %%q; available: %v", available)
+	for _, call := range calls {
+		out := types.ExecutionOutput{Error: fmt.Sprintf(availableErr, call.Function.Name)}
+		if err := a.appendToolResult(call, out); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (ia *InteractiveAgent) whitelisted(cmd string) bool {

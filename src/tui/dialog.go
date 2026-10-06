@@ -42,9 +42,34 @@ type dialog struct {
 	all      []dlgOption // unfiltered options (models picker)
 	filter   string
 	selected int
+
+	// rows is the row budget the dialog may occupy (0 = unbounded). The
+	// model sets it from the terminal height so a long approval cannot push
+	// the transcript off screen; the confirm dialog then windows its command
+	// text instead of growing without limit.
+	rows int
+
+	// scroll is the first visible command row in the confirm dialog, and
+	// region/total are the last rendered window geometry, so the key handler
+	// can page and clamp without re-wrapping the commands.
+	scroll int
+	region int
+	total  int
 }
 
-const maxModelRows = 12
+// maxModelRows caps the models picker; maxConfirmCmdRows caps the confirm
+// dialog's command viewport. Both are further trimmed by the row budget.
+const (
+	maxModelRows      = 12
+	maxConfirmCmdRows = 8
+	// confirmScrollbarGutter is the width reserved on the right of every
+	// command row for the scrollbar column, so drawing the bar never pushes
+	// a wrapped command past the sheet width.
+	confirmScrollbarGutter = 2
+)
+
+// resize records the row budget assigned by the model.
+func (d *dialog) resize(rows int) { d.rows = rows }
 
 func newModelsDialog(models []ModelChoice) *dialog {
 	opts := make([]dlgOption, 0, len(models))
@@ -160,6 +185,7 @@ func newHelpDialog() *dialog {
 func (d *dialog) render(width int, s styles) string {
 	cw := min(max(width-8, 16), 66)
 	var lines []string
+	confirmBlank, confirmHint := true, true
 	switch d.kind {
 	case dlgHelp:
 		lines = append(lines, s.agent.Render("keys"))
@@ -189,10 +215,24 @@ func (d *dialog) render(width int, s styles) string {
 		)...)
 	case dlgConfirm:
 		lines = append(lines, s.agent.Render("approve commands?"))
-		for _, c := range d.commands {
-			lines = append(lines, wrapAt(cw).Render(s.faint.Render("→ "+c)))
+		// Wrap every command first: the window counts display rows, not
+		// commands, so a single command with a lot of text still pages.
+		rows := d.wrapCommands(cw-confirmScrollbarGutter, s)
+		fixed := 1 + d.optionRows(cw) + 2 // title + options + border
+		window, footer, hint, blank := d.confirmWindow(len(rows), fixed)
+		start := min(max(d.scroll, 0), max(len(rows)-window, 0))
+		d.total, d.region, d.scroll = len(rows), window, start
+		confirmBlank, confirmHint = blank, hint
+		bar := d.scrollbar(start, window)
+		for i := 0; i < window; i++ {
+			lines = append(lines, rows[start+i]+bar[i])
 		}
-		lines = append(lines, "")
+		if footer {
+			lines = append(lines, s.faint.Render(d.confirmFooter(start)))
+		}
+		if blank {
+			lines = append(lines, "")
+		}
 	case dlgModels:
 		lines = append(lines, s.agent.Render("select model"))
 		if d.filter != "" {
@@ -229,7 +269,12 @@ func (d *dialog) render(width int, s styles) string {
 		lines = append(lines, s.faint.Render("↑/↓ move · type to filter · enter select · esc cancel"))
 		return s.dialog.Render(wrapAt(cw).Render(strings.Join(lines, "\n")))
 	}
-	lines = append(lines, "", s.faint.Render("↑/↓ move · enter select · esc cancel"))
+	if confirmBlank {
+		lines = append(lines, "")
+	}
+	if confirmHint {
+		lines = append(lines, s.faint.Render("↑/↓ move · enter select · esc cancel"))
+	}
 	return s.dialog.Render(wrapAt(cw).Render(strings.Join(lines, "\n")))
 }
 
@@ -244,4 +289,120 @@ func helpRows(rows ...[2]string) []string {
 		out[i] = key + r[1]
 	}
 	return out
+}
+
+// optionRows is the number of display rows the option list occupies at the
+// given width. Labels can wrap on narrow terminals, so the confirm budget must
+// count actual rows rather than assume one per option.
+func (d *dialog) optionRows(width int) int {
+	total := 0
+	for _, o := range d.options {
+		total += len(strings.Split(wrapAt(width).Render("  "+o.label), "\n"))
+	}
+	return total
+}
+
+// wrapCommands renders every command to its own display rows at the given
+// width. The window counts display rows rather than commands, which is what
+// lets a single command with a lot of text page instead of growing the sheet.
+func (d *dialog) wrapCommands(width int, s styles) []string {
+	out := make([]string, 0, len(d.commands))
+	for _, c := range d.commands {
+		out = append(out, strings.Split(wrapAt(width).Render(s.faint.Render("→ "+c)), "\n")...)
+	}
+	return out
+}
+
+// confirmWindow decides how many command display rows to show for the current
+// row budget and whether the optional footer, blank separators and hint fit.
+// The optional chrome is dropped before the command window is starved, so the
+// sheet never renders taller than the budget the model assigned. It keeps at
+// least one command row, so the sheet always shows the command being approved.
+func (d *dialog) confirmWindow(total, fixed int) (window int, footer, hint, blank bool) {
+	if total == 0 {
+		return 0, false, true, true
+	}
+	avail := maxConfirmCmdRows
+	if d.rows > 0 {
+		avail = d.rows - fixed
+	}
+	if avail < 1 {
+		// Even one command row does not fit the budget (the terminal is too
+		// small for the sheet); show one anyway and shed all optional chrome.
+		return 1, false, false, false
+	}
+	window = min(avail, maxConfirmCmdRows)
+	if total < window {
+		window = total
+	}
+	// footer + two blank separators + hint are four optional rows; keep them
+	// only when the leftover budget can actually hold them.
+	if avail-window >= 4 {
+		footer, hint, blank = total > window, true, true
+	}
+	return window, footer, hint, blank
+}
+
+// scrollbar draws a scrollbar column alongside a window of n rows: a filled
+// thumb whose position and length track the visible region, and a track
+// elsewhere. It is a blank column when the whole list fits, so short
+// approvals keep their old look.
+func (d *dialog) scrollbar(start, n int) []string {
+	out := make([]string, max(n, 0))
+	if n <= 0 || d.total <= n {
+		return out
+	}
+	thumb := max(n*n/d.total, 1)
+	trackTop := n - thumb
+	pos := 0
+	if trackTop > 0 {
+		pos = (start * trackTop) / max(d.total-n, 1)
+		pos = min(max(pos, 0), trackTop)
+	}
+	chars := []rune(strings.Repeat("│", n))
+	for i := 0; i < thumb && pos+i < n; i++ {
+		chars[pos+i] = '█'
+	}
+	for i, r := range chars {
+		out[i] = " " + string(r)
+	}
+	return out
+}
+
+// confirmScrollable reports whether the confirm dialog has a command window
+// to scroll. render() records the geometry (total/region), so probe with a
+// throwaway render at the real width when the first key arrives before the
+// dialog has been drawn with a styles value.
+func (d *dialog) confirmScrollable(width int) bool {
+	if d.kind != dlgConfirm {
+		return false
+	}
+	if d.total == 0 && d.region == 0 {
+		d.render(max(width, 1), styles{})
+	}
+	return d.total > d.region && d.region > 0
+}
+
+// pageCommands advances the scroll offset by delta rows (floored at the top)
+// and re-renders so region/total are up to date for the next clamp.
+func (d *dialog) pageCommands(delta, width int, s styles) {
+	d.scroll = max(d.scroll+delta, 0)
+	d.render(width, s)
+}
+
+// confirmPage is the number of command rows a page key should advance: one
+// screenful minus the overlap row that keeps context across the jump.
+func (d *dialog) confirmPage() int {
+	return max(d.region-1, 1)
+}
+
+// confirmFooter is the scroll hint shown under a windowed command list, with a
+// percentage so the user can tell how far down the command they are.
+func (d *dialog) confirmFooter(start int) string {
+	denom := d.total - d.region
+	if denom <= 0 {
+		return "↑/↓ scroll"
+	}
+	pct := min(start*100/denom, 100)
+	return fmt.Sprintf("↑/↓ scroll · %d%%", pct)
 }

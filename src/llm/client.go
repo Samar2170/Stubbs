@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"stubbs/src/types"
@@ -19,12 +20,26 @@ const maxAttempts = 3
 
 type ORClient struct {
 	apiKey    string
-	mu        sync.RWMutex // guards models; the active model can change at runtime
+	mu        sync.RWMutex // guards models/sendTools; the active model can change at runtime
 	models    []string
 	maxTokens int
 	baseURL   string
 	hc        *http.Client
 	Tools     []types.Tool
+	// sendTools controls whether tool definitions are sent with requests. It is
+	// cleared when the agent falls back to the text tool protocol.
+	sendTools bool
+}
+
+// SetNativeTools enables or disables sending tool definitions. It is safe to
+// call while a request is in flight.
+func (c *ORClient) SetNativeTools(enabled bool) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.sendTools = enabled
+	c.mu.Unlock()
 }
 
 // SetModel switches the active model. The change takes effect on the next
@@ -136,10 +151,11 @@ func NewORClient(apiKey string, modelIDs []string, toolRegistry *types.Registry,
 		modelIDs = []string{"z-ai/glm-5.3-flash"}
 	}
 	c := &ORClient{
-		apiKey:  apiKey,
-		models:  modelIDs,
-		baseURL: defaultBaseURL,
-		hc:      &http.Client{Timeout: 3 * time.Minute},
+		apiKey:    apiKey,
+		models:    modelIDs,
+		baseURL:   defaultBaseURL,
+		hc:        &http.Client{Timeout: 3 * time.Minute},
+		sendTools: true,
 	}
 	if toolRegistry != nil {
 		c.Tools = toolRegistry.List()
@@ -169,7 +185,14 @@ func (c *ORClient) toolDefinitions() []types.ToolDefinition {
 }
 
 func (c *ORClient) CompleteText(ctx context.Context, messages []types.Message) (ORChatResponse, error) {
-	return c.complete(ctx, messages, c.toolDefinitions())
+	c.mu.RLock()
+	send := c.sendTools
+	c.mu.RUnlock()
+	var tools []types.ToolDefinition
+	if send {
+		tools = c.toolDefinitions()
+	}
+	return c.complete(ctx, messages, tools)
 }
 
 // Complete is like CompleteText but does not offer any tools. It is used for
@@ -203,13 +226,29 @@ func (c *ORClient) complete(ctx context.Context, messages []types.Message, tools
 			}
 			return resp, nil
 		}
-		var apiErr *APIError
-		if !errors.As(err, &apiErr) || !apiErr.Retryable() {
+		if !retryable(ctx, err) {
 			return ORChatResponse{}, err
 		}
 		lastErr = err
 	}
 	return ORChatResponse{}, fmt.Errorf("openrouter: giving up after %d attempts: %w", maxAttempts, lastErr)
+}
+
+// retryable reports whether err is worth another attempt. API errors are
+// retried when the status is transient; transport timeouts (including
+// http.Client.Timeout) are retried too, since a slow provider response is not
+// fatal. A cancelled or expired parent context is never retried: the caller
+// owns that deadline and handles it explicitly.
+func retryable(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Retryable()
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 func (c *ORClient) query(ctx context.Context, model string, messages []types.Message, tools []types.ToolDefinition) (ORChatResponse, error) {
