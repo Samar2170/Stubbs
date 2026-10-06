@@ -53,32 +53,32 @@ func TestCommandOfFileTools(t *testing.T) {
 	}{
 		{
 			name: "read",
-			call: types.ToolCall{Function: types.FunctionCall{Name: "file_read", Arguments: `{"file_path":"a.go"}`}},
+			call: types.ToolCall{Function: types.FunctionCall{Name: "read", Arguments: `{"file_path":"a.go"}`}},
 			want: "read a.go",
 		},
 		{
 			name: "write",
-			call: types.ToolCall{Function: types.FunctionCall{Name: "file_write", Arguments: `{"file_path":"a.go","content":"hi"}`}},
+			call: types.ToolCall{Function: types.FunctionCall{Name: "write", Arguments: `{"file_path":"a.go","content":"hi"}`}},
 			want: "write a.go (2 bytes)",
 		},
 		{
 			name: "append",
-			call: types.ToolCall{Function: types.FunctionCall{Name: "file_write", Arguments: `{"file_path":"a.go","content":"hi","append":true}`}},
+			call: types.ToolCall{Function: types.FunctionCall{Name: "write", Arguments: `{"file_path":"a.go","content":"hi","append":true}`}},
 			want: "append a.go (2 bytes)",
 		},
 		{
 			name: "list default",
-			call: types.ToolCall{Function: types.FunctionCall{Name: "file_list", Arguments: `{}`}},
+			call: types.ToolCall{Function: types.FunctionCall{Name: "list", Arguments: `{}`}},
 			want: "list .",
 		},
 		{
 			name: "list recursive",
-			call: types.ToolCall{Function: types.FunctionCall{Name: "file_list", Arguments: `{"path":"src","recursive":true}`}},
+			call: types.ToolCall{Function: types.FunctionCall{Name: "list", Arguments: `{"path":"src","recursive":true}`}},
 			want: "list src (recursive)",
 		},
 		{
 			name: "edit",
-			call: types.ToolCall{Function: types.FunctionCall{Name: "file_edit", Arguments: `{"file_path":"a.go"}`}},
+			call: types.ToolCall{Function: types.FunctionCall{Name: "edit", Arguments: `{"file_path":"a.go"}`}},
 			want: "edit a.go",
 		},
 		{
@@ -87,8 +87,8 @@ func TestCommandOfFileTools(t *testing.T) {
 			want: "ls -la",
 		},
 		{
-			name: "web_fetch",
-			call: types.ToolCall{Function: types.FunctionCall{Name: "web_fetch", Arguments: `{"url":"https://example.com"}`}},
+			name: "webfetch",
+			call: types.ToolCall{Function: types.FunctionCall{Name: "webfetch", Arguments: `{"url":"https://example.com"}`}},
 			want: "fetch https://example.com",
 		},
 		{
@@ -108,7 +108,7 @@ func TestCommandOfFileTools(t *testing.T) {
 
 func TestConfirmCallsRespectsApproval(t *testing.T) {
 	bashCall := types.ToolCall{Function: types.FunctionCall{Name: "bash", Arguments: `{"command":"ls"}`}}
-	readCall := types.ToolCall{Function: types.FunctionCall{Name: "file_read", Arguments: `{"file_path":"a.go"}`}}
+	readCall := types.ToolCall{Function: types.FunctionCall{Name: "read", Arguments: `{"file_path":"a.go"}`}}
 
 	cases := []struct {
 		name         string
@@ -123,14 +123,14 @@ func TestConfirmCallsRespectsApproval(t *testing.T) {
 		{
 			name:        "approved tool skips prompt",
 			mode:        ModeConfirm,
-			approval:    map[string]string{"file_read": "allow"},
+			approval:    map[string]string{"read": "allow"},
 			calls:       []types.ToolCall{readCall},
 			wantConfirm: false,
 		},
 		{
 			name:        "unlisted tool prompts",
 			mode:        ModeConfirm,
-			approval:    map[string]string{"file_read": "allow"},
+			approval:    map[string]string{"read": "allow"},
 			calls:       []types.ToolCall{bashCall},
 			wantConfirm: true,
 		},

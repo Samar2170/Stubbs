@@ -79,6 +79,15 @@ type ModelChoice struct {
 	Name string
 }
 
+// SessionChoice is a selectable entry in the /sessions picker: a persisted
+// session's id, the first message the user sent, and how recent it is.
+type SessionChoice struct {
+	ID           string
+	FirstMessage string
+	Updated      time.Time
+	Messages     int
+}
+
 type modelMsg string
 type modelsLoadedMsg struct {
 	models []ModelChoice
@@ -90,6 +99,15 @@ type modelSwitchedMsg struct {
 }
 type repoMapMsg struct {
 	err error
+}
+type sessionsLoadedMsg struct {
+	sessions []SessionChoice
+	err      error
+}
+type sessionOpenedMsg struct {
+	id   string
+	msgs []types.Message
+	err  error
 }
 
 const idlePlaceholder = "Type here…  (/h for help)"
@@ -109,6 +127,13 @@ type MemoryHandlers struct {
 	Map      func() error
 }
 
+// SessionHandlers wires the /sessions picker: List fetches the saved sessions
+// and Open resumes one, returning the transcript to replay.
+type SessionHandlers struct {
+	List func() ([]SessionChoice, error)
+	Open func(id string) ([]types.Message, error)
+}
+
 // App implements agent.UI on top of a full-screen Bubble Tea program.
 // Ask* methods block on a reply channel that the Update loop resolves.
 type App struct {
@@ -117,6 +142,7 @@ type App struct {
 	modelsFn  func() ([]ModelChoice, error)
 	switchFn  func(id string) error
 	memory    *MemoryHandlers
+	sessions  *SessionHandlers
 	autoQuit  bool
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -151,6 +177,9 @@ func (a *App) SetModelHandlers(fetch func() ([]ModelChoice, error), switchTo fun
 // SetMemoryHandlers wires the callbacks used by the /remember, /forget and
 // /memory commands.
 func (a *App) SetMemoryHandlers(h MemoryHandlers) { a.memory = &h }
+
+// SetSessionHandlers wires the callbacks used by the /sessions picker.
+func (a *App) SetSessionHandlers(h SessionHandlers) { a.sessions = &h }
 
 // Run runs the TUI until the user quits. When it returns, any prompt that is
 // still waiting for an answer is released so the agent goroutine can stop.
@@ -451,6 +480,36 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = "repository map updated"
 		return m, nil
 
+	case sessionsLoadedMsg:
+		m.working = false
+		if msg.err != nil {
+			m.statusErr = true
+			m.status = "could not load sessions: " + msg.err.Error()
+			return m, nil
+		}
+		if len(msg.sessions) == 0 {
+			m.statusErr = false
+			m.status = "no previous sessions"
+			return m, nil
+		}
+		m.status = ""
+		m.statusErr = false
+		m.dlg = newSessionsDialog(msg.sessions)
+		m.layout()
+		return m, nil
+
+	case sessionOpenedMsg:
+		m.working = false
+		if msg.err != nil {
+			m.statusErr = true
+			m.status = "could not open session: " + msg.err.Error()
+			return m, nil
+		}
+		m.statusErr = false
+		m.status = "resumed session " + msg.id
+		m.replaySession(msg.msgs)
+		return m, nil
+
 	case inputReqMsg:
 		m.working = false
 		m.menu.close()
@@ -659,7 +718,7 @@ func (m *model) updateTA(msg tea.Msg) tea.Cmd {
 
 func (m *model) handleDialogKey(key string) (tea.Model, tea.Cmd) {
 	d := m.dlg
-	if d.kind == dlgModels {
+	if d.kind == dlgModels || d.kind == dlgSessions {
 		switch key {
 		case "ctrl+c":
 			if m.done {
@@ -829,8 +888,11 @@ func (m *model) pickDialogOption() tea.Cmd {
 		return nil
 	}
 	o := d.options[d.selected]
-	if d.kind == dlgModels {
+	switch {
+	case d.kind == dlgModels:
 		return m.switchModel(o.text)
+	case d.kind == dlgSessions:
+		return m.openSession(o.text)
 	}
 	switch o.action {
 	case dlgReject:
@@ -877,6 +939,78 @@ func (m *model) loadModels() tea.Cmd {
 		models, err := app.modelsFn()
 		return modelsLoadedMsg{models: models, err: err}
 	}
+}
+
+// loadSessions fetches the saved session list off the Update loop.
+func (m *model) loadSessions() tea.Cmd {
+	app := m.app
+	return func() tea.Msg {
+		if app == nil || app.sessions == nil || app.sessions.List == nil {
+			return sessionsLoadedMsg{err: errors.New("session list is not wired up")}
+		}
+		sessions, err := app.sessions.List()
+		return sessionsLoadedMsg{sessions: sessions, err: err}
+	}
+}
+
+// openSession resumes a saved session off the Update loop and returns its
+// transcript for replay.
+func (m *model) openSession(id string) tea.Cmd {
+	if id == "" {
+		return nil
+	}
+	m.dlg = nil
+	m.working = true
+	m.statusErr = false
+	m.status = "opening session…"
+	m.layout()
+	app := m.app
+	return func() tea.Msg {
+		if app == nil || app.sessions == nil || app.sessions.Open == nil {
+			return sessionOpenedMsg{id: id, err: errors.New("session resume is not wired up")}
+		}
+		msgs, err := app.sessions.Open(id)
+		return sessionOpenedMsg{id: id, msgs: msgs, err: err}
+	}
+}
+
+// replaySession clears the transcript and redraws a resumed session, then
+// keeps the active prompt (the initial task prompt) so the user can type a
+// follow-up task that continues the resumed conversation.
+func (m *model) replaySession(msgs []types.Message) {
+	m.blocks = nil
+	m.rows = nil
+	m.tLines = nil
+	m.dirty = true
+	for _, msg := range msgs {
+		switch msg.Role {
+		case types.RoleUser:
+			if strings.TrimSpace(msg.Content) != "" {
+				m.appendBlock(userBlock{text: msg.Content})
+			}
+		case types.RoleAssistant:
+			if strings.TrimSpace(msg.Content) != "" {
+				m.appendBlock(assistantBlock{content: msg.Content})
+			}
+		case types.RoleTool:
+			m.appendBlock(toolBlock{
+				name:     msg.Name,
+				out:      types.ExecutionOutput{Output: msg.Content},
+				expanded: false,
+			})
+		}
+	}
+	m.appendBlock(infoBlock{text: "resumed session — type a follow-up task to continue"})
+	m.working = false
+	m.done = false
+	m.stick = true
+	// Deliberately keep m.pending: opening a session happens before a task is
+	// submitted, and the same prompt now collects the follow-up task.
+	m.menu.close()
+	m.dlg = nil
+	m.ta.Reset()
+	m.ta.Focus()
+	m.layout()
 }
 
 func (m *model) generateRepoMap() tea.Cmd {
@@ -1048,6 +1182,16 @@ func (m *model) submitPending() tea.Cmd {
 		m.statusErr = false
 		m.status = "loading models…"
 		return m.loadModels()
+	}
+	// TUI-side: /sessions opens the previous-session picker. It is only
+	// meaningful before the first task, where the prompt is collected; at
+	// agent prompts the same text could be a legitimate reply.
+	if trimmedText == "/sessions" && m.pending.kind == inTask {
+		m.ta.Reset()
+		m.menu.close()
+		m.statusErr = false
+		m.status = "loading sessions…"
+		return m.loadSessions()
 	}
 	// TUI-side memory commands never reach the agent.
 	if cmd, handled := m.memoryCommand(trimmedText); handled {

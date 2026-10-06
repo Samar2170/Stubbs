@@ -201,6 +201,32 @@ func run() error {
 		ia.SetModel(id) // updates the client, the agent, the session and the header
 		return config.SaveModel(id)
 	})
+	app.SetSessionHandlers(tui.SessionHandlers{
+		List: func() ([]tui.SessionChoice, error) {
+			infos, err := agent.ListSessions()
+			if err != nil {
+				return nil, err
+			}
+			out := make([]tui.SessionChoice, len(infos))
+			for i, info := range infos {
+				out[i] = tui.SessionChoice{
+					ID:           info.ID,
+					FirstMessage: info.FirstMessage,
+					Updated:      info.Updated,
+					Messages:     info.Messages,
+				}
+			}
+			return out, nil
+		},
+		Open: func(id string) ([]types.Message, error) {
+			session, msgs, err := agent.LoadSession(ia.Model, id)
+			if err != nil {
+				return nil, err
+			}
+			ia.ResumeSession(session)
+			return msgs, nil
+		},
+	})
 	if memStore != nil {
 		app.SetMemoryHandlers(tui.MemoryHandlers{
 			Remember: func(text string) error {

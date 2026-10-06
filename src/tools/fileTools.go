@@ -97,8 +97,8 @@ func errOutput(tool string, err error) types.ExecutionOutput {
 }
 
 // ---------------------------------------------------------------------------
-// file_read
-// ---------------------------------------------------------------------------
+// read
+// ------------------------------------------------------------------------
 
 type FileReadTool struct {
 	fileTool
@@ -115,7 +115,7 @@ func NewFileReadTool(root string) *FileReadTool {
 	}
 }
 
-func (t *FileReadTool) Name() string { return "file_read" }
+func (t *FileReadTool) Name() string { return "read" }
 
 func (t *FileReadTool) Description() string {
 	return "Read a file from disk and return its contents. For large files use " +
@@ -152,26 +152,26 @@ type fileReadArgs struct {
 func (t *FileReadTool) Execute(ctx context.Context, args string) types.ExecutionOutput {
 	var a fileReadArgs
 	if err := json.Unmarshal([]byte(args), &a); err != nil {
-		return errOutput("file_read", fmt.Errorf("invalid arguments: %w", err))
+		return errOutput(t.Name(), fmt.Errorf("invalid arguments: %w", err))
 	}
 	path, err := t.resolveInRoot(a.FilePath)
 	if err != nil {
-		return errOutput("file_read", err)
+		return errOutput(t.Name(), err)
 	}
 	if !t.ReadSecrets && isSecretFile(path) {
-		return errOutput("file_read", fmt.Errorf(
+		return errOutput(t.Name(), fmt.Errorf(
 			"reading %s is disabled (enable with --read-secrets)", a.FilePath))
 	}
 	info, err := os.Stat(path)
 	if err != nil {
-		return errOutput("file_read", fmt.Errorf("cannot access file: %w", err))
+		return errOutput(t.Name(), fmt.Errorf("cannot access file: %w", err))
 	}
 	if info.IsDir() {
-		return errOutput("file_read", fmt.Errorf("%s is a directory (use file_list)", a.FilePath))
+		return errOutput(t.Name(), fmt.Errorf("%s is a directory (use list)", a.FilePath))
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return errOutput("file_read", fmt.Errorf("failed to read file: %w", err))
+		return errOutput(t.Name(), fmt.Errorf("failed to read file: %w", err))
 	}
 
 	lines := strings.Split(string(data), "\n")
@@ -212,8 +212,8 @@ func (t *FileReadTool) maxLines() int {
 }
 
 // ---------------------------------------------------------------------------
-// file_write
-// ---------------------------------------------------------------------------
+// write
+// -----------------------------------------------------------------------
 
 type FileWriteTool struct {
 	fileTool
@@ -223,7 +223,7 @@ func NewFileWriteTool(root string) *FileWriteTool {
 	return &FileWriteTool{fileTool: newFileTool(root)}
 }
 
-func (t *FileWriteTool) Name() string { return "file_write" }
+func (t *FileWriteTool) Name() string { return "write" }
 
 func (t *FileWriteTool) Description() string {
 	return "Write content to a file, creating any missing parent directories. " +
@@ -260,17 +260,17 @@ type fileWriteArgs struct {
 func (t *FileWriteTool) Execute(ctx context.Context, args string) types.ExecutionOutput {
 	var a fileWriteArgs
 	if err := json.Unmarshal([]byte(args), &a); err != nil {
-		return errOutput("file_write", fmt.Errorf("invalid arguments: %w", err))
+		return errOutput(t.Name(), fmt.Errorf("invalid arguments: %w", err))
 	}
 	path, err := t.resolveInRoot(a.FilePath)
 	if err != nil {
-		return errOutput("file_write", err)
+		return errOutput(t.Name(), err)
 	}
 	if info, err := os.Stat(path); err == nil && info.IsDir() {
-		return errOutput("file_write", fmt.Errorf("%s is a directory", a.FilePath))
+		return errOutput(t.Name(), fmt.Errorf("%s is a directory", a.FilePath))
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return errOutput("file_write", fmt.Errorf("failed to create parent directories: %w", err))
+		return errOutput(t.Name(), fmt.Errorf("failed to create parent directories: %w", err))
 	}
 	flag := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
 	if a.Append {
@@ -278,15 +278,15 @@ func (t *FileWriteTool) Execute(ctx context.Context, args string) types.Executio
 	}
 	f, err := os.OpenFile(path, flag, 0o644)
 	if err != nil {
-		return errOutput("file_write", fmt.Errorf("failed to open file: %w", err))
+		return errOutput(t.Name(), fmt.Errorf("failed to open file: %w", err))
 	}
 	n, writeErr := f.WriteString(a.Content)
 	closeErr := f.Close()
 	if writeErr != nil {
-		return errOutput("file_write", fmt.Errorf("failed to write file: %w", writeErr))
+		return errOutput(t.Name(), fmt.Errorf("failed to write file: %w", writeErr))
 	}
 	if closeErr != nil {
-		return errOutput("file_write", fmt.Errorf("failed to write file: %w", closeErr))
+		return errOutput(t.Name(), fmt.Errorf("failed to write file: %w", closeErr))
 	}
 	verb := "wrote"
 	if a.Append {
@@ -299,8 +299,8 @@ func (t *FileWriteTool) Execute(ctx context.Context, args string) types.Executio
 }
 
 // ---------------------------------------------------------------------------
-// file_edit
-// ---------------------------------------------------------------------------
+// edit
+// ------------------------------------------------------------------------
 
 type FileEditTool struct {
 	fileTool
@@ -310,7 +310,7 @@ func NewFileEditTool(root string) *FileEditTool {
 	return &FileEditTool{fileTool: newFileTool(root)}
 }
 
-func (t *FileEditTool) Name() string { return "file_edit" }
+func (t *FileEditTool) Name() string { return "edit" }
 
 func (t *FileEditTool) Description() string {
 	return "Replace an exact string in a file. old_string must appear exactly " +
@@ -352,33 +352,33 @@ type fileEditArgs struct {
 func (t *FileEditTool) Execute(ctx context.Context, args string) types.ExecutionOutput {
 	var a fileEditArgs
 	if err := json.Unmarshal([]byte(args), &a); err != nil {
-		return errOutput("file_edit", fmt.Errorf("invalid arguments: %w", err))
+		return errOutput(t.Name(), fmt.Errorf("invalid arguments: %w", err))
 	}
 	if a.OldString == "" {
-		return errOutput("file_edit", errors.New("old_string cannot be empty"))
+		return errOutput(t.Name(), errors.New("old_string cannot be empty"))
 	}
 	path, err := t.resolveInRoot(a.FilePath)
 	if err != nil {
-		return errOutput("file_edit", err)
+		return errOutput(t.Name(), err)
 	}
 	info, err := os.Stat(path)
 	if err != nil {
-		return errOutput("file_edit", fmt.Errorf("cannot access file: %w", err))
+		return errOutput(t.Name(), fmt.Errorf("cannot access file: %w", err))
 	}
 	if info.IsDir() {
-		return errOutput("file_edit", fmt.Errorf("%s is a directory", a.FilePath))
+		return errOutput(t.Name(), fmt.Errorf("%s is a directory", a.FilePath))
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return errOutput("file_edit", fmt.Errorf("failed to read file: %w", err))
+		return errOutput(t.Name(), fmt.Errorf("failed to read file: %w", err))
 	}
 	content := string(data)
 	count := strings.Count(content, a.OldString)
 	if count == 0 {
-		return errOutput("file_edit", fmt.Errorf("old_string not found in %s", a.FilePath))
+		return errOutput(t.Name(), fmt.Errorf("old_string not found in %s", a.FilePath))
 	}
 	if count > 1 && !a.ReplaceAll {
-		return errOutput("file_edit", fmt.Errorf(
+		return errOutput(t.Name(), fmt.Errorf(
 			"old_string matches %d times in %s; add more context or set replace_all", count, a.FilePath))
 	}
 	replaced := 1
@@ -391,7 +391,7 @@ func (t *FileEditTool) Execute(ctx context.Context, args string) types.Execution
 	}
 	perm := info.Mode().Perm()
 	if err := os.WriteFile(path, []byte(updated), perm); err != nil {
-		return errOutput("file_edit", fmt.Errorf("failed to write file: %w", err))
+		return errOutput(t.Name(), fmt.Errorf("failed to write file: %w", err))
 	}
 	return types.ExecutionOutput{
 		Output: fmt.Sprintf("edited %s (%d replacement(s))", a.FilePath, replaced),
@@ -400,8 +400,8 @@ func (t *FileEditTool) Execute(ctx context.Context, args string) types.Execution
 }
 
 // ---------------------------------------------------------------------------
-// file_list
-// ---------------------------------------------------------------------------
+// list
+// ------------------------------------------------------------------------
 
 type FileListTool struct {
 	fileTool
@@ -415,7 +415,7 @@ func NewFileListTool(root string) *FileListTool {
 	}
 }
 
-func (t *FileListTool) Name() string { return "file_list" }
+func (t *FileListTool) Name() string { return "list" }
 
 func (t *FileListTool) Description() string {
 	return "List the contents of a directory. Directories are shown with a " +
@@ -453,15 +453,15 @@ type fileListArgs struct {
 func (t *FileListTool) Execute(ctx context.Context, args string) types.ExecutionOutput {
 	var a fileListArgs
 	if err := json.Unmarshal([]byte(args), &a); err != nil {
-		return errOutput("file_list", fmt.Errorf("invalid arguments: %w", err))
+		return errOutput(t.Name(), fmt.Errorf("invalid arguments: %w", err))
 	}
 	dir, err := t.resolveInRoot(a.Path)
 	if err != nil {
-		return errOutput("file_list", err)
+		return errOutput(t.Name(), err)
 	}
 	info, err := os.Stat(dir)
 	if err != nil {
-		return errOutput("file_list", fmt.Errorf("cannot access path: %w", err))
+		return errOutput(t.Name(), fmt.Errorf("cannot access path: %w", err))
 	}
 	if !info.IsDir() {
 		return types.ExecutionOutput{Output: formatListEntry(filepath.Base(dir), info, false), Code: 0}
@@ -511,7 +511,7 @@ func (t *FileListTool) Execute(ctx context.Context, args string) types.Execution
 	} else {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
-			return errOutput("file_list", fmt.Errorf("failed to read directory: %w", err))
+			return errOutput(t.Name(), fmt.Errorf("failed to read directory: %w", err))
 		}
 		for _, d := range entries {
 			if d.IsDir() && d.Name() == ignoredDirName {

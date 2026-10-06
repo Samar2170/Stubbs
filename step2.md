@@ -1,5 +1,5 @@
-1. Context mgmt 
-2. Memory mgmt
+1. Context mgmt [X]
+2. Memory mgmt [X]
 3. multi agent orchestration
 4. whitelist certain commands
 5. configurable tools [X]

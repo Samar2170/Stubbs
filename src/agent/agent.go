@@ -190,6 +190,19 @@ func (a *Agent) Run(ctx context.Context, task string) (string, error) {
 	return resp, nil
 }
 
+// ResumeSession swaps the agent's active session for a previously persisted
+// one (see LoadSession) and closes the session it replaces. Subsequent messages
+// are appended to the resumed log, so a run continues the old conversation.
+func (a *Agent) ResumeSession(s *Session) {
+	if a == nil || s == nil {
+		return
+	}
+	if a.Session != nil && a.Session != s {
+		_ = a.Session.Close()
+	}
+	a.Session = s
+}
+
 // SetModel switches the model used for subsequent requests and records the
 // change on the session. It is a no-op when the model is already active.
 func (a *Agent) SetModel(model string) {
