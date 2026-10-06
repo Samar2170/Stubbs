@@ -38,6 +38,16 @@ func (r *Registry) Get(name string) (Tool, bool) {
 	tool, ok := r.tools[name]
 	return tool, ok
 }
+
+// Has reports whether a tool with the given name is registered.
+func (r *Registry) Has(name string) bool {
+	if r == nil {
+		return false
+	}
+	_, ok := r.tools[name]
+	return ok
+}
+
 func (r *Registry) List() []Tool {
 	tools := make([]Tool, 0, len(r.tools))
 	for _, tool := range r.tools {
