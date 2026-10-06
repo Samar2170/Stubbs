@@ -104,6 +104,14 @@ type sessionsLoadedMsg struct {
 	sessions []SessionChoice
 	err      error
 }
+type memoryListMsg struct {
+	items []string
+	err   error
+}
+type memoryOpMsg struct {
+	status string
+	err    error
+}
 type sessionOpenedMsg struct {
 	id   string
 	msgs []types.Message
@@ -150,10 +158,15 @@ type App struct {
 
 func New(opts Options) *App {
 	m := &model{
-		opts:      opts,
-		st:        newStyles(loadTheme(opts.Theme)),
-		mode:      opts.Mode,
-		showTools: true,
+		opts:        opts,
+		st:          newStyles(loadTheme(opts.Theme)),
+		mode:        opts.Mode,
+		showTools:   true,
+		layoutDirty: true,
+		selAnchor:   -1,
+		selHead:     -1,
+		selStyledLo: -1,
+		selStyledHi: -1,
 	}
 	m.vp = viewport.New(80, 24)
 	m.ta = newTextarea()
@@ -366,15 +379,22 @@ type model struct {
 	blocks      []block
 	rows        []int // cumulative transcript line count per block
 	tLines      []tLine
+	viewLines   []string // styled viewport lines, kept in step with tLines
+	selStyledLo int      // last selection range styled into viewLines (-1 = none)
+	selStyledHi int
 	selAnchor   int // selection anchor line (-1 = no selection)
 	selHead     int // selection head line
 	selecting   bool
 	stick       bool // follow the bottom of the transcript
 	showTools   bool // global expand/collapse for tool output (start expanded)
-	dirty       bool
+	dirty       bool // transcript needs a full re-render (width change/toggle)
+	layoutDirty bool // layout() needs to re-run before the next View
+	headerView  string
+	statusView  string
 	vp          viewport.Model
 	ta          textarea.Model
 	sp          spinner.Model
+	spinning    bool
 	status      string
 	statusErr   bool
 	statusSince time.Time
@@ -407,7 +427,20 @@ func newTextarea() textarea.Model {
 }
 
 func (m *model) Init() tea.Cmd {
-	return tea.Batch(textarea.Blink, m.sp.Tick)
+	// The spinner only ticks while the agent is busy (see spinnerCmd), so an
+	// idle TUI never repaints just to animate it.
+	return textarea.Blink
+}
+
+// spinnerCmd starts the spinner tick if work is in flight and it is not already
+// running. Callers that turn m.working on should return it alongside their own
+// command so the animation starts immediately.
+func (m *model) spinnerCmd() tea.Cmd {
+	if !m.busy() || m.spinning {
+		return nil
+	}
+	m.spinning = true
+	return m.sp.Tick
 }
 
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -426,22 +459,27 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.statusErr = false
 		m.working = true
 		m.statusSince = time.Now()
-		return m, nil
+		m.layoutDirty = true
+		return m, m.spinnerCmd()
 
 	case headerMsg:
 		m.steps, m.cost = msg.steps, msg.cost
+		m.layoutDirty = true
 		return m, nil
 
 	case modeMsg:
 		m.mode = agent.Mode(msg)
+		m.layoutDirty = true
 		return m, nil
 
 	case modelMsg:
 		m.opts.Model = string(msg)
+		m.layoutDirty = true
 		return m, nil
 
 	case modelsLoadedMsg:
 		m.working = false
+		m.layoutDirty = true
 		if msg.err != nil {
 			m.statusErr = true
 			m.status = "could not load models: " + msg.err.Error()
@@ -460,6 +498,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case modelSwitchedMsg:
 		m.working = false
+		m.layoutDirty = true
 		if msg.err != nil {
 			m.statusErr = true
 			m.status = "switch failed: " + msg.err.Error()
@@ -471,6 +510,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case repoMapMsg:
 		m.working = false
+		m.layoutDirty = true
 		if msg.err != nil {
 			m.statusErr = true
 			m.status = "repo map failed: " + msg.err.Error()
@@ -482,6 +522,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case sessionsLoadedMsg:
 		m.working = false
+		m.layoutDirty = true
 		if msg.err != nil {
 			m.statusErr = true
 			m.status = "could not load sessions: " + msg.err.Error()
@@ -500,6 +541,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case sessionOpenedMsg:
 		m.working = false
+		m.layoutDirty = true
 		if msg.err != nil {
 			m.statusErr = true
 			m.status = "could not open session: " + msg.err.Error()
@@ -508,6 +550,38 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.statusErr = false
 		m.status = "resumed session " + msg.id
 		m.replaySession(msg.msgs)
+		return m, nil
+
+	case memoryListMsg:
+		m.working = false
+		m.layoutDirty = true
+		if msg.err != nil {
+			m.statusErr = true
+			m.status = "memory: " + msg.err.Error()
+			return m, nil
+		}
+		m.statusErr = false
+		if len(msg.items) == 0 {
+			m.status = "memory is empty"
+			return m, nil
+		}
+		// The listing can be long, so it goes into the scrollable transcript
+		// where each entry wraps; the status stays short so it does not crowd
+		// out the composer.
+		m.status = fmt.Sprintf("%d memories", len(msg.items))
+		m.appendBlock(infoBlock{text: fmt.Sprintf("%d memories:\n%s", len(msg.items), strings.Join(msg.items, "\n"))})
+		return m, nil
+
+	case memoryOpMsg:
+		m.working = false
+		m.layoutDirty = true
+		if msg.err != nil {
+			m.statusErr = true
+			m.status = "memory: " + msg.err.Error()
+			return m, nil
+		}
+		m.statusErr = false
+		m.status = msg.status
 		return m, nil
 
 	case inputReqMsg:
@@ -528,6 +602,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ta.Placeholder = m.placeholderFor(msg.kind)
 		m.ta.Reset()
 		m.ta.Focus()
+		m.layoutDirty = true
 		return m, textarea.Blink
 
 	case limitsReqMsg:
@@ -537,6 +612,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ta.Placeholder = fmt.Sprintf("new limits, e.g. '%d %.2f'  ·  q ends the run", msg.stepLimit, msg.costLimit)
 		m.ta.Reset()
 		m.ta.Focus()
+		m.layoutDirty = true
 		return m, textarea.Blink
 
 	case doneMsg:
@@ -562,19 +638,22 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 
 	case spinner.TickMsg:
-		if m.working {
-			if m.statusSince.IsZero() {
-				m.statusSince = msg.Time
-			}
-		} else {
+		if !m.busy() {
+			m.spinning = false
 			m.statusSince = time.Time{}
+			return m, nil
 		}
+		if m.statusSince.IsZero() {
+			m.statusSince = msg.Time
+		}
+		m.layoutDirty = true // the elapsed-time suffix changes the status text
 		var cmd tea.Cmd
 		m.sp, cmd = m.sp.Update(msg)
 		return m, cmd
 
 	case copiedMsg:
 		m.working = false
+		m.layoutDirty = true
 		m.status = fmt.Sprintf("copied %d line%s to clipboard", int(msg), pluralLines(int(msg)))
 		return m, nil
 
@@ -694,6 +773,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		if !m.done {
 			m.status = "agent is busy — ctrl-c interrupts"
+			m.layoutDirty = true
 		}
 		return m, nil
 	}
@@ -747,12 +827,14 @@ func (m *model) handleDialogKey(key string) (tea.Model, tea.Cmd) {
 			if d.filter != "" {
 				d.filter = d.filter[:len(d.filter)-1]
 				d.applyFilter()
+				m.layoutDirty = true
 			}
 			return m, nil
 		default:
 			if r := []rune(key); len(r) == 1 && r[0] >= 0x20 {
 				d.filter += key
 				d.applyFilter()
+				m.layoutDirty = true
 			}
 			return m, nil
 		}
@@ -766,6 +848,7 @@ func (m *model) handleDialogKey(key string) (tea.Model, tea.Cmd) {
 			m.resolveReply(d.reply, inputResult{interrupted: true})
 		} else {
 			m.dlg = nil
+			m.layoutDirty = true
 		}
 		return m, nil
 
@@ -773,6 +856,7 @@ func (m *model) handleDialogKey(key string) (tea.Model, tea.Cmd) {
 		switch d.kind {
 		case dlgHelp:
 			m.dlg = nil
+			m.layoutDirty = true
 		case dlgConfirm:
 			m.swapComposer(inReject, "Rejecting — what went wrong?", "what should the agent do instead? · ctrl-c=abort")
 		default: // exit: esc finishes
@@ -828,6 +912,7 @@ func (m *model) handleDialogKey(key string) (tea.Model, tea.Cmd) {
 	case "enter":
 		if d.kind == dlgHelp {
 			m.dlg = nil
+			m.layoutDirty = true
 			return m, nil
 		}
 		return m, m.pickDialogOption()
@@ -856,6 +941,7 @@ func (m *model) handleDialogKey(key string) (tea.Model, tea.Cmd) {
 	case "q":
 		if d.kind == dlgHelp {
 			m.dlg = nil
+			m.layoutDirty = true
 		}
 		return m, nil
 	}
@@ -918,7 +1004,7 @@ func (m *model) switchModel(id string) tea.Cmd {
 	m.status = "switching to " + id + "…"
 	m.layout()
 	app := m.app
-	return func() tea.Msg {
+	doSwitch := func() tea.Msg {
 		if app == nil || app.switchFn == nil {
 			return modelSwitchedMsg{id: id, err: errors.New("model switching is not wired up")}
 		}
@@ -927,6 +1013,7 @@ func (m *model) switchModel(id string) tea.Cmd {
 		}
 		return modelSwitchedMsg{id: id}
 	}
+	return tea.Batch(m.spinnerCmd(), doSwitch)
 }
 
 // loadModels fetches the provider's model catalog off the Update loop.
@@ -965,13 +1052,14 @@ func (m *model) openSession(id string) tea.Cmd {
 	m.status = "opening session…"
 	m.layout()
 	app := m.app
-	return func() tea.Msg {
+	doOpen := func() tea.Msg {
 		if app == nil || app.sessions == nil || app.sessions.Open == nil {
 			return sessionOpenedMsg{id: id, err: errors.New("session resume is not wired up")}
 		}
 		msgs, err := app.sessions.Open(id)
 		return sessionOpenedMsg{id: id, msgs: msgs, err: err}
 	}
+	return tea.Batch(m.spinnerCmd(), doOpen)
 }
 
 // replaySession clears the transcript and redraws a resumed session, then
@@ -981,6 +1069,8 @@ func (m *model) replaySession(msgs []types.Message) {
 	m.blocks = nil
 	m.rows = nil
 	m.tLines = nil
+	m.viewLines = nil
+	m.selStyledLo, m.selStyledHi = -1, -1
 	m.dirty = true
 	for _, msg := range msgs {
 		switch msg.Role {
@@ -1033,79 +1123,101 @@ func (m *model) memoryCommand(text string) (tea.Cmd, bool) {
 		if h.Map == nil {
 			m.statusErr = true
 			m.status = "repo map is not wired up"
+			m.layoutDirty = true
 			return nil, true
 		}
 		m.statusErr = false
 		m.working = true
 		m.status = "generating repository map…"
-		m.layout()
-		return m.generateRepoMap(), true
+		m.layoutDirty = true
+		return tea.Batch(m.spinnerCmd(), m.generateRepoMap()), true
 	case text == "/memory":
 		if h.List == nil {
 			m.statusErr = true
 			m.status = "memory is not wired up"
-			return nil, true
-		}
-		items, err := h.List()
-		if err != nil {
-			m.statusErr = true
-			m.status = "memory: " + err.Error()
+			m.layoutDirty = true
 			return nil, true
 		}
 		m.statusErr = false
-		if len(items) == 0 {
-			m.status = "memory is empty"
-			return nil, true
-		}
-		// The listing can be long, so it goes into the scrollable transcript
-		// where each entry wraps; the status stays short so it does not crowd
-		// out the composer.
-		m.status = fmt.Sprintf("%d memories", len(items))
-		m.appendBlock(infoBlock{text: fmt.Sprintf("%d memories:\n%s", len(items), strings.Join(items, "\n"))})
-		return nil, true
+		m.working = true
+		m.status = "loading memories…"
+		m.layoutDirty = true
+		return tea.Batch(m.spinnerCmd(), m.listMemoryCmd()), true
 	case strings.HasPrefix(text, "/remember"):
 		body := strings.TrimSpace(strings.TrimPrefix(text, "/remember"))
 		if body == "" {
 			m.statusErr = true
 			m.status = "usage: /remember <text>"
+			m.layoutDirty = true
 			return nil, true
 		}
 		if h.Remember == nil {
 			m.statusErr = true
 			m.status = "memory is not wired up"
-			return nil, true
-		}
-		if err := h.Remember(body); err != nil {
-			m.statusErr = true
-			m.status = "memory: " + err.Error()
+			m.layoutDirty = true
 			return nil, true
 		}
 		m.statusErr = false
-		m.status = "remembered"
-		return nil, true
+		m.working = true
+		m.status = "remembering…"
+		m.layoutDirty = true
+		return tea.Batch(m.spinnerCmd(), m.rememberCmd(body)), true
 	case strings.HasPrefix(text, "/forget"):
 		query := strings.TrimSpace(strings.TrimPrefix(text, "/forget"))
 		if query == "" {
 			m.statusErr = true
 			m.status = "usage: /forget <id or query>"
+			m.layoutDirty = true
 			return nil, true
 		}
 		if h.Forget == nil {
 			m.statusErr = true
 			m.status = "memory is not wired up"
-			return nil, true
-		}
-		n, err := h.Forget(query)
-		if err != nil {
-			m.statusErr = true
-			m.status = "memory: " + err.Error()
+			m.layoutDirty = true
 			return nil, true
 		}
 		m.statusErr = false
-		m.status = fmt.Sprintf("forgot %d memory entries", n)
-		return nil, true
+		m.working = true
+		m.status = "forgetting…"
+		m.layoutDirty = true
+		return tea.Batch(m.spinnerCmd(), m.forgetCmd(query)), true
 	}
 	return nil, false
+}
+
+// listMemoryCmd loads the memory listing off the Update loop.
+func (m *model) listMemoryCmd() tea.Cmd {
+	app := m.app
+	return func() tea.Msg {
+		if app == nil || app.memory == nil || app.memory.List == nil {
+			return memoryListMsg{err: errors.New("memory is not wired up")}
+		}
+		items, err := app.memory.List()
+		return memoryListMsg{items: items, err: err}
+	}
+}
+
+// rememberCmd persists a memory entry off the Update loop.
+func (m *model) rememberCmd(text string) tea.Cmd {
+	app := m.app
+	return func() tea.Msg {
+		if app == nil || app.memory == nil || app.memory.Remember == nil {
+			return memoryOpMsg{err: errors.New("memory is not wired up")}
+		}
+		return memoryOpMsg{status: "remembered", err: app.memory.Remember(text)}
+	}
+}
+
+// forgetCmd deletes matching memories off the Update loop.
+func (m *model) forgetCmd(query string) tea.Cmd {
+	app := m.app
+	return func() tea.Msg {
+		if app == nil || app.memory == nil || app.memory.Forget == nil {
+			return memoryOpMsg{err: errors.New("memory is not wired up")}
+		}
+		n, err := app.memory.Forget(query)
+		return memoryOpMsg{status: fmt.Sprintf("forgot %d memory entries", n), err: err}
+	}
 }
 
 // swapComposer turns the active dialog into a composer prompt that answers
@@ -1134,6 +1246,8 @@ func (m *model) interruptKey() (tea.Model, tea.Cmd) {
 		m.app.interrupt()
 		m.status = "interrupting — tell the agent what happened…"
 		m.working = true
+		m.layoutDirty = true
+		return m, m.spinnerCmd()
 	}
 	return m, nil
 }
@@ -1153,6 +1267,7 @@ func (m *model) submitPending() tea.Cmd {
 			m.ta.Reset()
 			m.statusErr = true
 			m.status = "enter '<steps> <cost>' (e.g. '24 5'), or q to end the run"
+			m.layoutDirty = true
 			return nil
 		}
 		m.resolve(inputResult{text: fmt.Sprintf("%d %v", steps, cost)})
@@ -1180,8 +1295,10 @@ func (m *model) submitPending() tea.Cmd {
 		m.ta.Reset()
 		m.menu.close()
 		m.statusErr = false
+		m.working = true
 		m.status = "loading models…"
-		return m.loadModels()
+		m.layoutDirty = true
+		return tea.Batch(m.spinnerCmd(), m.loadModels())
 	}
 	// TUI-side: /sessions opens the previous-session picker. It is only
 	// meaningful before the first task, where the prompt is collected; at
@@ -1190,8 +1307,10 @@ func (m *model) submitPending() tea.Cmd {
 		m.ta.Reset()
 		m.menu.close()
 		m.statusErr = false
+		m.working = true
 		m.status = "loading sessions…"
-		return m.loadSessions()
+		m.layoutDirty = true
+		return tea.Batch(m.spinnerCmd(), m.loadSessions())
 	}
 	// TUI-side memory commands never reach the agent.
 	if cmd, handled := m.memoryCommand(trimmedText); handled {
@@ -1262,7 +1381,7 @@ func (m *model) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	if m.dlg != nil {
 		return nil
 	}
-	row := msg.Y - 1 // -1: header row
+	row := msg.Y - max(m.headerH, 1) // header rows sit above the transcript
 	if row < 0 || row >= m.vp.Height {
 		return nil
 	}
@@ -1382,7 +1501,29 @@ func (m *model) appendBlock(b block) {
 		m.stick = true
 	}
 	m.blocks = append(m.blocks, b)
-	m.dirty = true
+	m.appendBlockLines(b)
+	if m.stick {
+		m.vp.GotoBottom()
+	}
+}
+
+// appendBlockLines renders a single block and appends its transcript lines
+// (plus the blank separator) to the caches, without re-rendering the rest of
+// the transcript. This keeps transcript growth linear instead of re-rendering
+// every block on each append.
+func (m *model) appendBlockLines(b block) {
+	w := max(m.vp.Width, 1)
+	raw := strings.Split(b.render(w, m.st), "\n")
+	for _, ln := range raw {
+		m.tLines = append(m.tLines, tLine{plain: ansi.Strip(ln), ansi: ln})
+	}
+	m.tLines = append(m.tLines, tLine{}) // blank line between blocks
+	total := len(raw)
+	if len(m.rows) > 0 {
+		total += m.rows[len(m.rows)-1] + 1
+	}
+	m.rows = append(m.rows, total)
+	m.applySelection()
 }
 
 func (m *model) layout() {
@@ -1390,7 +1531,8 @@ func (m *model) layout() {
 		return
 	}
 	m.ta.SetWidth(max(m.w-2, 1))
-	m.headerH = m.headerHeight()
+	m.headerView = m.header()
+	m.headerH = max(len(strings.Split(m.headerView, "\n")), 1)
 	m.inputH = m.desiredInputH()
 	// Budget every transcript-external section so the whole view fits in h
 	// rows while keeping at least one transcript row. Trim the optional
@@ -1435,6 +1577,11 @@ func (m *model) layout() {
 	}
 	m.vp.Width = m.w
 	m.vp.Height = max(m.h-m.usedRows(), 1)
+	// Cache the header and status lines so View() does not re-render them on
+	// every frame (the dialog, pending prompt, menu and composer are cheap and
+	// rendered fresh, since their state can change between layouts).
+	m.statusView = m.statusLine()
+	m.layoutDirty = false
 }
 
 // budgetDialog tells the modal how many rows the terminal can spare. The
@@ -1507,15 +1654,6 @@ func (m *model) pendingLine() string {
 	return strings.Join(lines, "\n")
 }
 
-// headerHeight is the number of rows the header occupies; it can wrap to two
-// rows on narrow terminals once the wordmark and mode badge no longer fit.
-func (m *model) headerHeight() int {
-	if m.w == 0 {
-		return 1
-	}
-	return max(len(strings.Split(m.header(), "\n")), 1)
-}
-
 // usedRows counts every transcript-external row the view needs, using the row
 // budgets layout() assigned.
 func (m *model) usedRows() int {
@@ -1578,6 +1716,8 @@ func (m *model) renderTranscript() {
 	}
 	m.rows = rows
 	m.tLines = lines
+	m.viewLines = nil
+	m.selStyledLo, m.selStyledHi = -1, -1
 	m.dirty = false
 	m.applySelection()
 	if m.stick {
@@ -1586,25 +1726,45 @@ func (m *model) renderTranscript() {
 }
 
 // applySelection rebuilds the viewport content from the cached transcript
-// lines, highlighting the selected range. Cheap: no block re-rendering.
+// lines, highlighting the selected range. Only the lines whose selection state
+// changed are restyled; the styled-line cache is reused across drag events.
 func (m *model) applySelection() {
 	if len(m.tLines) == 0 {
+		m.viewLines = m.viewLines[:0]
+		m.selStyledLo, m.selStyledHi = -1, -1
+		m.vp.SetContent("")
 		return
 	}
+	// Keep the styled cache in step with the transcript. It only grows on
+	// append; a shorter cache means the transcript was rebuilt from scratch.
+	if len(m.viewLines) > len(m.tLines) {
+		m.viewLines = make([]string, len(m.tLines))
+		for i := range m.tLines {
+			m.viewLines[i] = m.tLines[i].ansi
+		}
+		m.selStyledLo, m.selStyledHi = -1, -1
+	}
+	for len(m.viewLines) < len(m.tLines) {
+		i := len(m.viewLines)
+		m.viewLines = append(m.viewLines, m.tLines[i].ansi)
+	}
+
 	lo, hi := m.selRange()
-	parts := make([]string, len(m.tLines))
-	for i, l := range m.tLines {
-		if i >= lo && i <= hi {
-			txt := l.plain
-			if strings.TrimSpace(txt) == "" {
-				txt = " "
-			}
-			parts[i] = m.st.selLine.Render(txt)
-		} else {
-			parts[i] = l.ansi
+	// Un-highlight lines that were selected before but no longer are.
+	for i := m.selStyledLo; i <= m.selStyledHi && i >= 0; i++ {
+		if i < len(m.viewLines) && (i < lo || i > hi) {
+			m.viewLines[i] = m.tLines[i].ansi
 		}
 	}
-	m.vp.SetContent(strings.Join(parts, "\n"))
+	for i := lo; i <= hi; i++ {
+		txt := m.tLines[i].plain
+		if strings.TrimSpace(txt) == "" {
+			txt = " "
+		}
+		m.viewLines[i] = m.st.selLine.Render(txt)
+	}
+	m.selStyledLo, m.selStyledHi = lo, hi
+	m.vp.SetContent(strings.Join(m.viewLines, "\n"))
 }
 
 func (m *model) busy() bool {
@@ -1668,10 +1828,12 @@ func (m *model) View() string {
 	if m.w == 0 {
 		return "loading…"
 	}
-	// Status text and the pending prompt change without going through layout(),
-	// so reflow here to keep their row budgets (and the composer/viewport
-	// sizes) in step. layout() is cheap unless the width changed.
-	m.layout()
+	// layout() only re-runs when something that affects the row budget changed
+	// (window size, status, pending prompt, dialog, composer height). Handlers
+	// that mutate those set layoutDirty, so a steady frame does no layout work.
+	if m.layoutDirty {
+		m.layout()
+	}
 	if m.dirty {
 		m.renderTranscript()
 	}
@@ -1692,7 +1854,7 @@ func (m *model) View() string {
 		}
 		bottom = append(bottom, box.Render(m.ta.View()))
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, m.header(), m.vp.View(), m.statusLine(), strings.Join(bottom, "\n"))
+	return lipgloss.JoinVertical(lipgloss.Left, m.headerView, m.vp.View(), m.statusView, strings.Join(bottom, "\n"))
 }
 
 // shortDuration renders an elapsed duration compactly (e.g. "1m32s", "45s").

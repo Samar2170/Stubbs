@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -20,6 +21,38 @@ func testModel() *model {
 	return m
 }
 
+// runCmd executes a command and flattens any tea.BatchMsg into the messages
+// produced by its sub-commands. It lets tests work with handlers that batch a
+// spinner tick alongside their real command.
+func runCmd(cmd tea.Cmd) []tea.Msg {
+	if cmd == nil {
+		return nil
+	}
+	msg := cmd()
+	if batch, ok := msg.(tea.BatchMsg); ok {
+		var out []tea.Msg
+		for _, c := range batch {
+			out = append(out, runCmd(c)...)
+		}
+		return out
+	}
+	if msg == nil {
+		return nil
+	}
+	return []tea.Msg{msg}
+}
+
+// findMsg runs cmd and returns the first message of type T it produces.
+func findMsg[T any](cmd tea.Cmd) (T, bool) {
+	var zero T
+	for _, msg := range runCmd(cmd) {
+		if v, ok := msg.(T); ok {
+			return v, true
+		}
+	}
+	return zero, false
+}
+
 // TestAwaitReturnsWhenAppClosed guards against the freeze where main blocked
 // on wg.Wait() forever because a pending Ask* never resolved after the TUI
 // program stopped (e.g. ctrl-c delivered as SIGINT).
@@ -28,6 +61,44 @@ func TestAwaitReturnsWhenAppClosed(t *testing.T) {
 	close(a.closed)
 	if _, err := a.await(make(chan inputResult, 1)); !errors.Is(err, agent.ErrInterrupted) {
 		t.Fatalf("await after program stop = %v, want ErrInterrupted", err)
+	}
+}
+
+func TestSpinnerOnlyTicksWhileBusy(t *testing.T) {
+	m := testModel()
+	_, cmd := m.Update(statusMsg("waiting for LLM..."))
+	if cmd == nil || !m.spinning {
+		t.Fatal("a busy status should start the spinner")
+	}
+	m.Update(copiedMsg(1)) // clears working
+	if m.busy() {
+		t.Fatal("a clipboard status must not count as busy")
+	}
+	_, cmd = m.Update(spinner.TickMsg{})
+	if cmd != nil || m.spinning {
+		t.Fatal("an idle spinner tick should stop and schedule nothing")
+	}
+}
+
+func TestAppendBlockRendersIncrementally(t *testing.T) {
+	m := testModel()
+	m.vp.Width, m.vp.Height = 80, 20
+
+	m.appendBlock(userBlock{text: "hello"})
+	if len(m.tLines) == 0 {
+		t.Fatal("appendBlock should render its lines without a full re-render")
+	}
+	first := len(m.tLines)
+
+	m.appendBlock(infoBlock{text: "world"})
+	if len(m.tLines) <= first {
+		t.Fatal("a second append should extend the transcript")
+	}
+	if len(m.rows) != 2 {
+		t.Fatalf("rows = %v, want 2 entries", m.rows)
+	}
+	if m.rows[1] <= m.rows[0] {
+		t.Fatalf("rows should accumulate across blocks: %v", m.rows)
 	}
 }
 
@@ -556,8 +627,9 @@ func TestModelsDialogSelectSwitches(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("picking a model should return a switch command")
 	}
-	if res, ok := cmd().(modelSwitchedMsg); !ok || res.err != nil || res.id != "b/two" {
-		t.Fatalf("switch cmd = %+v", cmd())
+	res, ok := findMsg[modelSwitchedMsg](cmd)
+	if !ok || res.err != nil || res.id != "b/two" {
+		t.Fatalf("switch cmd = %+v, %v", res, ok)
 	}
 	if switched != "b/two" {
 		t.Errorf("switchFn called with %q, want b/two", switched)

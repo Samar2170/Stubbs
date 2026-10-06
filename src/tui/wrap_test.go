@@ -163,9 +163,14 @@ func TestMemoryCommandListsInTranscript(t *testing.T) {
 	m.layout()
 
 	cmd, handled := m.memoryCommand("/memory")
-	if !handled || cmd != nil {
-		t.Fatalf("memoryCommand(/memory) = %v, %v; want handled with no cmd", cmd, handled)
+	if !handled || cmd == nil {
+		t.Fatalf("memoryCommand(/memory) = %v, %v; want handled with a fetch cmd", cmd, handled)
 	}
+	msg, ok := findMsg[memoryListMsg](cmd)
+	if !ok || msg.err != nil {
+		t.Fatalf("memory list cmd = %+v, %v", msg, ok)
+	}
+	m.Update(msg)
 	if len(m.blocks) != 1 {
 		t.Fatalf("memory listing should add one transcript block, got %d", len(m.blocks))
 	}

@@ -84,9 +84,9 @@ func TestSessionsDialogSelectResumes(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("picking a session should return an open command")
 	}
-	msg, ok := cmd().(sessionOpenedMsg)
+	msg, ok := findMsg[sessionOpenedMsg](cmd)
 	if !ok {
-		t.Fatalf("open cmd produced %T, want sessionOpenedMsg", cmd())
+		t.Fatalf("open cmd produced no sessionOpenedMsg")
 	}
 	if msg.err != nil || msg.id != "7" {
 		t.Fatalf("open msg = %+v", msg)
@@ -109,7 +109,11 @@ func TestSessionOpenErrorSetsStatus(t *testing.T) {
 	}}
 	m.dlg = newSessionsDialog([]SessionChoice{{ID: "7", FirstMessage: "x", Updated: time.Now()}})
 	cmd := m.pickDialogOption()
-	m.Update(cmd())
+	msg, ok := findMsg[sessionOpenedMsg](cmd)
+	if !ok {
+		t.Fatal("open cmd produced no sessionOpenedMsg")
+	}
+	m.Update(msg)
 	if !m.statusErr || !strings.Contains(m.status, "boom") {
 		t.Fatalf("open error should surface in status, got %q (err=%v)", m.status, m.statusErr)
 	}
