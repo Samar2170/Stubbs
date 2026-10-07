@@ -38,44 +38,14 @@ func TestCheckBudgetAutoQuitSkipsPrompt(t *testing.T) {
 	}
 }
 
-func TestCommandOfFileTools(t *testing.T) {
+func TestCommandOf(t *testing.T) {
 	cases := []struct {
 		name string
 		call types.ToolCall
 		want string
 	}{
 		{
-			name: "read",
-			call: types.ToolCall{Function: types.FunctionCall{Name: "file_read", Arguments: `{"file_path":"a.go"}`}},
-			want: "read a.go",
-		},
-		{
-			name: "write",
-			call: types.ToolCall{Function: types.FunctionCall{Name: "file_write", Arguments: `{"file_path":"a.go","content":"hi"}`}},
-			want: "write a.go (2 bytes)",
-		},
-		{
-			name: "append",
-			call: types.ToolCall{Function: types.FunctionCall{Name: "file_write", Arguments: `{"file_path":"a.go","content":"hi","append":true}`}},
-			want: "append a.go (2 bytes)",
-		},
-		{
-			name: "list default",
-			call: types.ToolCall{Function: types.FunctionCall{Name: "file_list", Arguments: `{}`}},
-			want: "list .",
-		},
-		{
-			name: "list recursive",
-			call: types.ToolCall{Function: types.FunctionCall{Name: "file_list", Arguments: `{"path":"src","recursive":true}`}},
-			want: "list src (recursive)",
-		},
-		{
-			name: "edit",
-			call: types.ToolCall{Function: types.FunctionCall{Name: "file_edit", Arguments: `{"file_path":"a.go"}`}},
-			want: "edit a.go",
-		},
-		{
-			name: "bash falls through",
+			name: "bash command",
 			call: types.ToolCall{Function: types.FunctionCall{Name: "bash", Arguments: `{"command":"ls -la"}`}},
 			want: "ls -la",
 		},

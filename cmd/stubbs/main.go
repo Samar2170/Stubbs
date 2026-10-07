@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -48,7 +49,7 @@ func run() error {
 	humanF := fs.BoolP("human", "H", false, "start in human mode (you type the commands)")
 	whitelistF := fs.StringSlice("whitelist", nil, "regex whitelist of commands that skip confirmation (confirm mode)")
 	workdirF := fs.StringP("workdir", "C", "", "working directory the agent's tools are confined to (default: current directory)")
-	readSecretsF := fs.Bool("read-secrets", false, "allow the agent to read .env/secret files")
+	readSecretsF := fs.Bool("read-secrets", false, "allow the @ picker to attach .env/secret files")
 	outputF := fs.StringP("output", "o", "", "write the run to this JSON file")
 	exitNowF := fs.Bool("exit-immediately", false, "don't confirm when the agent wants to finish")
 	autoQuitF := fs.Bool("auto-quit", false, "quit automatically when the run ends (benchmark mode; implies --exit-immediately)")
@@ -111,13 +112,13 @@ func run() error {
 	registry := types.NewRegistry()
 	bashTool := tools.NewBashTool()
 	bashTool.Dir = workdir
+	if tools.SandboxAvailable("bwrap") {
+		bashTool.Confine = true
+		bashTool.SandboxHome = filepath.Join(config.ProjectDir, "sandbox-home")
+	} else if _, err := exec.LookPath("bwrap"); err == nil {
+		fmt.Fprintln(os.Stderr, "stubbs: warning: bubblewrap is installed but cannot create sandboxes; running commands unconfined")
+	}
 	registry.Register(bashTool)
-	readTool := tools.NewFileReadTool(workdir)
-	readTool.ReadSecrets = *readSecretsF
-	registry.Register(readTool)
-	registry.Register(tools.NewFileWriteTool(workdir))
-	registry.Register(tools.NewFileListTool(workdir))
-	registry.Register(tools.NewFileEditTool(workdir))
 	client := llm.NewORClient(cfg.APIKey, []string{model}, registry)
 	environ := env.NewLocalEnvironment(env.EnvironmentConfig{WorkingDir: workdir, Timeout: 300}, registry)
 

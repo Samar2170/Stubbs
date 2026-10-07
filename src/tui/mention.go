@@ -189,7 +189,7 @@ func dirAttachment(rel, path string) string {
 	return b.String()
 }
 
-// isSecretPath mirrors the file tools' .env detection.
+// isSecretPath detects .env-style secret files.
 func isSecretPath(path string) bool {
 	base := filepath.Base(path)
 	return base == ".env" || strings.HasPrefix(base, ".env.")
