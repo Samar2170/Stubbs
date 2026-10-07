@@ -88,13 +88,19 @@ type modelSwitchedMsg struct {
 	err error
 }
 
-const idlePlaceholder = "Type here…  (/h for help)"
+const idlePlaceholder = "Type here…  @ to attach a file  (/h for help)"
 
 type Options struct {
 	Model    string
 	AutoQuit bool
 	Theme    string
 	Mode     agent.Mode
+	// Workdir is the root scanned by the @ file/dir picker and the root that
+	// mention paths are resolved against. Empty means the current directory.
+	Workdir string
+	// ReadSecrets allows the @ picker to attach .env-style files, matching
+	// the file_read tool's gate.
+	ReadSecrets bool
 }
 
 // App implements agent.UI on top of a full-screen Bubble Tea program.
@@ -111,10 +117,12 @@ type App struct {
 
 func New(opts Options) *App {
 	m := &model{
-		opts:      opts,
-		st:        newStyles(loadTheme(opts.Theme)),
-		mode:      opts.Mode,
-		showTools: true,
+		opts:        opts,
+		st:          newStyles(loadTheme(opts.Theme)),
+		mode:        opts.Mode,
+		showTools:   true,
+		workdir:     opts.Workdir,
+		readSecrets: opts.ReadSecrets,
 	}
 	m.vp = viewport.New(80, 24)
 	m.ta = newTextarea()
@@ -337,6 +345,12 @@ type model struct {
 	dlg       *dialog
 	expanded  bool
 	done      bool
+
+	workdir       string
+	readSecrets   bool
+	mention       *mention
+	mentionCache  []mentionEntry
+	mentionLoaded bool
 }
 
 func newTextarea() textarea.Model {
@@ -449,6 +463,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.working = false
 		m.pending = nil
 		m.dlg = nil
+		m.closeMention()
 		m.status = msg.summary + " — ctrl+c or esc to quit"
 		m.doneOk = msg.ok
 		m.statusErr = !msg.ok
@@ -510,6 +525,13 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.dlg != nil {
 		return m.handleDialogKey(msg.String())
 	}
+	// The @ picker owns keys while it is open: arrows navigate, enter/tab
+	// accept, esc cancels, and ordinary runes extend the filter query.
+	if m.mention != nil && m.mention.active {
+		if handled, cmd := m.handleMentionKey(msg); handled {
+			return m, cmd
+		}
+	}
 	switch msg.String() {
 	case "ctrl+c":
 		if m.done {
@@ -547,6 +569,15 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.status = "agent is busy — ctrl-c interrupts"
 		}
 		return m, nil
+	}
+
+	// Typing "@" at a word boundary opens the file/directory picker. The
+	// "@" is inserted into the composer first so the token is visible even
+	// if the user dismisses the popup without choosing.
+	if msg.Type == tea.KeyRunes && len(msg.Runes) == 1 && msg.Runes[0] == '@' && m.canMention() && m.atMentionBoundary() {
+		cmd := m.updateTA(msg)
+		m.startMention()
+		return m, cmd
 	}
 
 	return m, m.updateTA(msg)
@@ -740,6 +771,7 @@ func (m *model) loadModels() tea.Cmd {
 func (m *model) swapComposer(kind inputKind, title string, placeholder string) {
 	m.pending = &pendingInput{kind: kind, title: title, reply: m.dlg.reply}
 	m.dlg = nil
+	m.closeMention()
 	m.ta.Reset()
 	m.ta.Placeholder = placeholder
 	m.ta.Focus()
@@ -765,6 +797,7 @@ func (m *model) interruptKey() (tea.Model, tea.Cmd) {
 }
 
 func (m *model) submitPending() tea.Cmd {
+	m.closeMention()
 	text := m.ta.Value()
 	if m.pending.kind == inLimits {
 		trimmed := strings.TrimSpace(text)
@@ -813,6 +846,7 @@ func (m *model) submitPending() tea.Cmd {
 		if t := strings.TrimSpace(text); t != "" {
 			m.appendBlock(userBlock{text: t})
 		}
+		text = m.expandMentions(text)
 	}
 	m.resolve(inputResult{text: text})
 	return nil
@@ -841,6 +875,7 @@ func (m *model) resetPrompt() {
 	m.status = ""
 	m.statusErr = false
 	m.working = false
+	m.closeMention()
 	m.ta.Reset()
 	m.ta.Placeholder = idlePlaceholder
 	m.ta.Focus()
@@ -1027,6 +1062,9 @@ func (m *model) usedRows() int {
 		if m.pending != nil {
 			used++
 		}
+		if mv := m.mentionView(); mv != "" {
+			used += lipgloss.Height(mv) + 1 // popup sits above the composer
+		}
 		used += m.inputH + 2 // composer border
 	}
 	return used
@@ -1122,6 +1160,9 @@ func (m *model) View() string {
 	} else {
 		if m.pending != nil {
 			bottom = append(bottom, m.st.agent.Render("❯ ")+m.st.info.Render(m.pending.title))
+		}
+		if mv := m.mentionView(); mv != "" {
+			bottom = append(bottom, lipgloss.PlaceHorizontal(m.w, lipgloss.Center, mv))
 		}
 		box := m.st.box
 		if m.pending != nil || (!m.done && m.status == "") {
