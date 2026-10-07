@@ -23,16 +23,19 @@ type Session struct {
 }
 
 type sessionRecord struct {
-	Timestamp  time.Time        `json:"timestamp"`
-	Type       string           `json:"type"`
-	Content    string           `json:"content"`
-	ToolCallID string           `json:"tool_call_id,omitempty"`
-	Name       string           `json:"name,omitempty"`
-	ToolCalls  []types.ToolCall `json:"tool_calls,omitempty"`
-	Error      string           `json:"error,omitempty"`
-	Code       int              `json:"code,omitempty"`
-	DurationMS int64            `json:"duration_ms,omitempty"`
-	Model      string           `json:"model"`
+	Timestamp        time.Time        `json:"timestamp"`
+	Type             string           `json:"type"`
+	Content          string           `json:"content"`
+	ToolCallID       string           `json:"tool_call_id,omitempty"`
+	Name             string           `json:"name,omitempty"`
+	ToolCalls        []types.ToolCall `json:"tool_calls,omitempty"`
+	Error            string           `json:"error,omitempty"`
+	Code             int              `json:"code,omitempty"`
+	DurationMS       int64            `json:"duration_ms,omitempty"`
+	PromptTokens     int              `json:"prompt_tokens,omitempty"`
+	CompletionTokens int              `json:"completion_tokens,omitempty"`
+	LatencyMS        int64            `json:"latency_ms,omitempty"`
+	Model            string           `json:"model"`
 }
 
 func randomUint() uint {
@@ -124,6 +127,24 @@ func toolRecord(call types.ToolCall, out types.ExecutionOutput, model string) se
 	}
 }
 
+// AppendModelTurn records per-turn metrics (prompt/completion tokens and wall
+// latency) so slow turns are visible in the session log.
+func (s *Session) AppendModelTurn(promptTokens, completionTokens int, latency time.Duration) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.write(sessionRecord{
+		Timestamp:        time.Now(),
+		Type:             "metrics",
+		PromptTokens:     promptTokens,
+		CompletionTokens: completionTokens,
+		LatencyMS:        latency.Milliseconds(),
+		Model:            s.model,
+	})
+}
+
 // AppendError records a non-fatal error (model call failure, retry, malformed
 // response). It never touches the API history so corrective events cannot
 // pollute the conversation.
@@ -149,16 +170,35 @@ func (s *Session) write(rec sessionRecord) error {
 	if _, err := s.w.Write(append(line, '\n')); err != nil {
 		return fmt.Errorf("write session record: %w", err)
 	}
-	return s.w.Sync()
+	// We deliberately do not fsync per record: the session log is diagnostic,
+	// and syncing on every append adds latency to the agent loop. Close flushes.
+	return nil
 }
 
 func (s *Session) ContextMessages(budget int) []types.Message {
+	kept, _ := s.ContextMessagesWithDropped(budget)
+	return kept
+}
+
+// ContextMessagesWithDropped returns the messages that fit budget plus the ones
+// that were compacted out, so the agent can summarize them.
+func (s *Session) ContextMessagesWithDropped(budget int) (kept []types.Message, dropped []types.Message) {
 	if s == nil {
-		return nil
+		return nil, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.context.Build(budget)
+	return s.context.BuildWithDropped(budget)
+}
+
+// InjectSummary inserts a digest of previously compacted turns into the context.
+func (s *Session) InjectSummary(content string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.context.AddSummary(content)
 }
 
 func (s *Session) InjectMemory(content string, importance float32) {
@@ -195,6 +235,12 @@ func (s *Session) Close() error {
 	if s == nil || s.w == nil {
 		return nil
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.w == nil {
+		return nil
+	}
+	_ = s.w.Sync()
 	err := s.w.Close()
 	s.w = nil
 	return err

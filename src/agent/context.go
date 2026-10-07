@@ -9,9 +9,11 @@ import (
 	"unicode/utf8"
 )
 
-const MODEL_LIMIT = 1000000
-
-var contextBudget = MODEL_LIMIT * 1 / 2
+// DefaultContextBudget caps how many tokens of history are sent to the model
+// per request. Keeping it small is what keeps per-turn latency flat: the whole
+// transcript is resent every turn, so an unbounded budget makes each turn
+// slower than the last.
+const DefaultContextBudget = 32000
 
 const minRecentTurns = 4
 
@@ -112,15 +114,28 @@ func (c *Context) AddMemory(content string, importance float32) {
 	c.Items[pos] = item
 }
 
-func (c *Context) addTask(task string) {
-	c.Items = append(c.Items, ContextItem{
-		ID:        "task",
-		Message:   types.Message{Role: types.RoleUser, Content: task},
-		Tokens:    estimateTokens(task),
+// AddSummary records a digest of turns that were compacted out of the context.
+// It is pinned (Type Plan) so it survives later reductions and the model keeps
+// the gist of work that is no longer verbatim in the transcript.
+func (c *Context) AddSummary(content string) {
+	if c == nil || strings.TrimSpace(content) == "" {
+		return
+	}
+	item := ContextItem{
+		Message:   types.Message{Role: types.RoleSystem, Content: content},
+		ID:        fmt.Sprintf("summary-%d", len(c.Items)),
+		Tokens:    estimateTokens(content),
 		Timestamp: time.Now(),
 		Pinned:    true,
-		Type:      Task,
-	})
+		Type:      Plan,
+	}
+	pos := 1
+	if pos > len(c.Items) {
+		pos = len(c.Items)
+	}
+	c.Items = append(c.Items, ContextItem{})
+	copy(c.Items[pos+1:], c.Items[pos:])
+	c.Items[pos] = item
 }
 
 func (c *Context) hasType(t ItemType) bool {
@@ -141,15 +156,23 @@ func (c *Context) totalTokens() int {
 }
 
 func (c *Context) Build(budget int) []types.Message {
+	kept, _ := c.BuildWithDropped(budget)
+	return kept
+}
+
+// BuildWithDropped reduces the context to fit budget and returns both the
+// surviving messages and the messages that were dropped, so the caller can
+// summarize them into a compact digest instead of losing the information.
+func (c *Context) BuildWithDropped(budget int) (kept []types.Message, dropped []types.Message) {
 	if c == nil {
-		return nil
+		return nil, nil
 	}
-	c.reduce(budget)
+	dropped = c.reduce(budget)
 	out := make([]types.Message, 0, len(c.Items))
 	for i := range c.Items {
 		out = append(out, c.Items[i].Message)
 	}
-	return out
+	return out, dropped
 }
 
 type turn struct {
@@ -213,13 +236,17 @@ func turnScore(items []ContextItem, t turn, rank, total int) float32 {
 	return score
 }
 
-func (c *Context) reduce(budget int) {
+// reduce drops the lowest-scoring unpinned turns until the context fits the
+// budget, and returns the messages it dropped. It drops the fewest turns that
+// make the context fit: a running total is decremented as each turn is marked,
+// so it never discards more history than the budget requires.
+func (c *Context) reduce(budget int) []types.Message {
 	if budget <= 0 || c.totalTokens() <= budget {
-		return
+		return nil
 	}
 	turns := groupTurns(c.Items)
 	if len(turns) == 0 {
-		return
+		return nil
 	}
 	protected := len(turns) - minRecentTurns
 	if protected < 0 {
@@ -238,20 +265,26 @@ func (c *Context) reduce(budget int) {
 			turnScore(c.Items, turns[ib], ib, len(turns))
 	})
 	drop := make([]bool, len(c.Items))
+	remaining := c.totalTokens()
 	for _, idx := range candidates {
-		if c.totalTokens() <= budget {
+		if remaining <= budget {
 			break
 		}
 		t := turns[idx]
 		for i := t.start; i < t.end; i++ {
 			drop[i] = true
+			remaining -= c.Items[i].Tokens
 		}
 	}
 	kept := make([]ContextItem, 0, len(c.Items))
+	var dropped []types.Message
 	for i := range c.Items {
-		if !drop[i] {
-			kept = append(kept, c.Items[i])
+		if drop[i] {
+			dropped = append(dropped, c.Items[i].Message)
+			continue
 		}
+		kept = append(kept, c.Items[i])
 	}
 	c.Items = kept
+	return dropped
 }

@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -29,6 +30,9 @@ type ORClient struct {
 	// sendTools controls whether tool definitions are sent with requests. It is
 	// cleared when the agent falls back to the text tool protocol.
 	sendTools bool
+	// streaming requests server-sent events so tokens arrive incrementally
+	// instead of buffering a whole (possibly multi-minute) completion.
+	streaming bool
 }
 
 // SetNativeTools enables or disables sending tool definitions. It is safe to
@@ -79,11 +83,17 @@ func (c *ORClient) activeModel() string {
 	return c.models[0]
 }
 
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
 type ORChatRequest struct {
-	Model     string                 `json:"model"`
-	Messages  []types.Message        `json:"messages"`
-	MaxTokens int                    `json:"max_tokens,omitempty"`
-	Tools     []types.ToolDefinition `json:"tools,omitempty"`
+	Model         string                 `json:"model"`
+	Messages      []types.Message        `json:"messages"`
+	MaxTokens     int                    `json:"max_tokens,omitempty"`
+	Tools         []types.ToolDefinition `json:"tools,omitempty"`
+	Stream        bool                   `json:"stream,omitempty"`
+	StreamOptions *streamOptions         `json:"stream_options,omitempty"`
 }
 
 type Usage struct {
@@ -146,6 +156,11 @@ func WithBaseURL(u string) Option {
 	return func(c *ORClient) { c.baseURL = u }
 }
 
+// WithStreaming enables or disables server-sent-event streaming.
+func WithStreaming(enabled bool) Option {
+	return func(c *ORClient) { c.streaming = enabled }
+}
+
 func NewORClient(apiKey string, modelIDs []string, toolRegistry *types.Registry, opts ...Option) *ORClient {
 	if len(modelIDs) == 0 {
 		modelIDs = []string{"z-ai/glm-5.3-flash"}
@@ -156,6 +171,7 @@ func NewORClient(apiKey string, modelIDs []string, toolRegistry *types.Registry,
 		baseURL:   defaultBaseURL,
 		hc:        &http.Client{Timeout: 3 * time.Minute},
 		sendTools: true,
+		streaming: true,
 	}
 	if toolRegistry != nil {
 		c.Tools = toolRegistry.List()
@@ -253,9 +269,14 @@ func retryable(ctx context.Context, err error) bool {
 
 func (c *ORClient) query(ctx context.Context, model string, messages []types.Message, tools []types.ToolDefinition) (ORChatResponse, error) {
 	var chatResp ORChatResponse
-	payload, err := json.Marshal(ORChatRequest{
+	reqBody := ORChatRequest{
 		Model: model, Messages: messages, MaxTokens: c.maxTokens, Tools: tools,
-	})
+	}
+	if c.streaming {
+		reqBody.Stream = true
+		reqBody.StreamOptions = &streamOptions{IncludeUsage: true}
+	}
+	payload, err := json.Marshal(reqBody)
 	if err != nil {
 		return chatResp, err
 	}
@@ -265,6 +286,9 @@ func (c *ORClient) query(ctx context.Context, model string, messages []types.Mes
 	}
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	req.Header.Set("Content-Type", "application/json")
+	if c.streaming {
+		req.Header.Set("Accept", "text/event-stream")
+	}
 	response, err := c.hc.Do(req)
 	if err != nil {
 		return chatResp, err
@@ -275,9 +299,112 @@ func (c *ORClient) query(ctx context.Context, model string, messages []types.Mes
 		body, _ := io.ReadAll(io.LimitReader(response.Body, 4<<10))
 		return chatResp, &APIError{Status: response.StatusCode, Body: string(body)}
 	}
+	// The provider may ignore stream:true and reply with a single JSON body;
+	// branch on the actual content type so both paths work.
+	if reqBody.Stream && strings.Contains(response.Header.Get("Content-Type"), "text/event-stream") {
+		return decodeStream(response.Body)
+	}
 	if err := json.NewDecoder(response.Body).Decode(&chatResp); err != nil {
 		return chatResp, err
 	}
 	return chatResp, nil
+}
 
+// streamChunk is one SSE data frame: deltas for the assistant message plus an
+// optional usage block on the final frame.
+type streamChunk struct {
+	Choices []struct {
+		Delta struct {
+			Content   string           `json:"content"`
+			ToolCalls []streamToolCall `json:"tool_calls"`
+		} `json:"delta"`
+		FinishReason string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage *Usage         `json:"usage,omitempty"`
+	Error *ResponseError `json:"error,omitempty"`
+}
+
+type streamToolCall struct {
+	Index    int    `json:"index"`
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+// decodeStream reassembles an OpenAI-compatible SSE chat completion into the
+// same ORChatResponse shape the non-streaming path returns.
+func decodeStream(r io.Reader) (ORChatResponse, error) {
+	var (
+		content   strings.Builder
+		usage     *Usage
+		finish    string
+		toolOrder []int
+		toolCalls = map[int]*types.ToolCall{}
+	)
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, ":") {
+			continue
+		}
+		data, ok := strings.CutPrefix(line, "data:")
+		if !ok {
+			continue
+		}
+		data = strings.TrimSpace(data)
+		if data == "[DONE]" {
+			break
+		}
+		var chunk streamChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+		if chunk.Error != nil {
+			return ORChatResponse{}, &APIError{Status: 200, Body: chunk.Error.Message}
+		}
+		if chunk.Usage != nil {
+			usage = chunk.Usage
+		}
+		for _, ch := range chunk.Choices {
+			content.WriteString(ch.Delta.Content)
+			if ch.FinishReason != "" {
+				finish = ch.FinishReason
+			}
+			for _, tc := range ch.Delta.ToolCalls {
+				cur, ok := toolCalls[tc.Index]
+				if !ok {
+					cur = &types.ToolCall{}
+					toolCalls[tc.Index] = cur
+					toolOrder = append(toolOrder, tc.Index)
+				}
+				if tc.ID != "" {
+					cur.ID = tc.ID
+				}
+				if tc.Type != "" {
+					cur.Type = tc.Type
+				}
+				cur.Function.Name += tc.Function.Name
+				cur.Function.Arguments += tc.Function.Arguments
+			}
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return ORChatResponse{}, err
+	}
+	msg := ResponseMessage{Role: "assistant", Content: content.String()}
+	for _, idx := range toolOrder {
+		tc := *toolCalls[idx]
+		if tc.Type == "" {
+			tc.Type = "function"
+		}
+		msg.ToolCalls = append(msg.ToolCalls, tc)
+	}
+	return ORChatResponse{
+		Choices: []Choice{{Message: msg, FinishReason: finish}},
+		Usage:   usage,
+	}, nil
 }

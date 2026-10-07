@@ -92,6 +92,11 @@ type InteractiveConfig struct {
 	AutoQuit         bool
 }
 
+// maxRepeatedCalls is how many turns in a row the identical tool call may be
+// issued before the loop breaks it with a correction. A legitimate re-run after
+// an edit is separated by the edit call, so consecutive repeats are a loop.
+const maxRepeatedCalls = 3
+
 type InteractiveAgent struct {
 	*Agent
 	cfg         InteractiveConfig
@@ -100,6 +105,9 @@ type InteractiveAgent struct {
 	interrupted atomic.Bool
 	stepMu      sync.Mutex
 	stepCancel  context.CancelFunc
+
+	lastCallKey     string
+	lastCallRepeats int
 }
 
 func NewInteractiveAgent(cfg InteractiveConfig, client llm.ModelClient, environ env.Environment, model string, ui UI) (*InteractiveAgent, error) {
@@ -152,6 +160,8 @@ func (ia *InteractiveAgent) SetModel(model string) {
 func (ia *InteractiveAgent) Run(ctx context.Context, task string) (string, error) {
 	defer ia.Close()
 	a := ia.Agent
+	a.resetRunCounters()
+	ia.lastCallKey, ia.lastCallRepeats = "", 0
 	if a.config.WallTimeLimit > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, time.Second*time.Duration(a.config.WallTimeLimit))
@@ -258,6 +268,15 @@ func (ia *InteractiveAgent) Run(ctx context.Context, task string) (string, error
 			}
 			continue
 		}
+		if ia.repeatedCall(known) {
+			if ia.lastCallRepeats > maxRepeatedCalls+maxMalformedRetries {
+				return "", fmt.Errorf("agent: model repeatedly called the same tool")
+			}
+			if err := ia.rejectRepeat(known); err != nil {
+				return "", err
+			}
+			continue
+		}
 		approved, err := ia.confirmCalls(known)
 		if err != nil {
 			// TODO: this block is repeated way too much
@@ -358,6 +377,11 @@ func marshalCommand(cmd string) string {
 }
 
 func (ia *InteractiveAgent) checkBudget() error {
+	// A hard model-call cap can never be raised: it bounds runaway runs even
+	// when the step/cost limits are interactive.
+	if ia.cfg.MaxModelCalls > 0 && ia.ModelCalls >= ia.cfg.MaxModelCalls {
+		return ErrLimitsExceeded
+	}
 	if ia.cfg.StepLimit <= 0 && ia.cfg.CostLimit <= 0 {
 		return nil
 	}
@@ -379,6 +403,9 @@ func (ia *InteractiveAgent) checkBudget() error {
 		}
 		if cost > 0 {
 			ia.cfg.CostLimit = cost
+		}
+		if ia.cfg.MaxModelCalls > 0 && ia.cfg.StepLimit > ia.cfg.MaxModelCalls {
+			ia.cfg.StepLimit = ia.cfg.MaxModelCalls
 		}
 	}
 	return nil
@@ -546,6 +573,52 @@ func (ia *InteractiveAgent) confirmCalls(calls []types.ToolCall) (bool, error) {
 			return false, nil
 		}
 	}
+}
+
+// repeatedCall reports whether the identical batch of tool calls has now been
+// issued more times in a row than maxRepeatedCalls allows.
+func (ia *InteractiveAgent) repeatedCall(calls []types.ToolCall) bool {
+	key := callsKey(calls)
+	if key == "" {
+		return false
+	}
+	if key == ia.lastCallKey {
+		ia.lastCallRepeats++
+	} else {
+		ia.lastCallKey = key
+		ia.lastCallRepeats = 1
+	}
+	return ia.lastCallRepeats > maxRepeatedCalls
+}
+
+// callsKey is a stable identity for a batch of tool calls (name + arguments).
+func callsKey(calls []types.ToolCall) string {
+	if len(calls) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, c := range calls {
+		b.WriteString(c.Function.Name)
+		b.WriteByte(0)
+		b.WriteString(c.Function.Arguments)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// rejectRepeat feeds a correction back so the model stops re-running the same
+// call and either uses the result it already has or changes approach.
+func (ia *InteractiveAgent) rejectRepeat(calls []types.ToolCall) error {
+	desc := callsKey(calls)
+	if len(desc) > 300 {
+		desc = desc[:300] + "…"
+	}
+	return ia.Agent.appendMessage(types.Message{
+		Role: types.RoleUser,
+		Content: fmt.Sprintf("You have issued the same tool call %d times in a row; its result is already in the conversation. "+
+			"Do not repeat it. Use the result you already have, try a different call, or give your final answer.\n\nRepeated call:\n%s",
+			ia.lastCallRepeats, desc),
+	})
 }
 
 // partitionCalls splits calls into those whose tool is registered and those

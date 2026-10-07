@@ -45,6 +45,12 @@ func SystemPromptFor(names []string) string {
 		fmt.Fprintf(&b, "Available tools: %s.\n", strings.Join(names, ", "))
 	}
 	b.WriteString("Only call the tools listed above, with exactly those names. If you need a capability that no tool provides, say so in plain text instead of inventing a tool.")
+	b.WriteString("\n\nWork efficiently:")
+	b.WriteString("\n- Batch independent tool calls into a single reply. If you need to read or search several files, issue all of those calls together instead of one per turn.")
+	b.WriteString("\n- Use grep to locate code and read with offset/limit for large files; avoid reading whole files or paging through them one small slice at a time.")
+	b.WriteString("\n- Do not re-read or re-run something already present in the conversation; reuse what you have.")
+	b.WriteString("\n- When you have enough evidence, STOP calling tools and give the final answer as plain text.")
+	b.WriteString("\n- For read-only tasks (audits, reviews, questions), do not create files, scratch tests, or commits; report findings in your reply.")
 	b.WriteString("\nPut throwaway scripts and notes in $TMPDIR or a scratch directory under $HOME; do not add temporary *_test.go files to a Go package, and do not rely on the sandbox /tmp path.")
 	return b.String()
 }
@@ -72,6 +78,12 @@ type AgentConfig struct {
 	StepLimit     int
 	CostLimit     float32
 	WallTimeLimit int
+	// MaxModelCalls is a hard ceiling on model requests per run. When > 0 the
+	// interactive loop cannot be extended past it. 0 disables the cap.
+	MaxModelCalls int
+	// ContextBudget bounds the tokens of history sent per request. 0 uses
+	// DefaultContextBudget.
+	ContextBudget int
 	WorkingDir    string
 	SystemPrompt  string
 	ToolNames     []string
@@ -153,8 +165,21 @@ func (a *Agent) setProtocol(p toolProtocol) {
 	}
 }
 
+// resetRunCounters starts a fresh budget for a top-level run. Counters are not
+// reset by continuations within a run, only when a new run begins.
+func (a *Agent) resetRunCounters() {
+	if a == nil {
+		return
+	}
+	a.Steps = 0
+	a.Cost = 0
+	a.ModelCalls = 0
+	a.StartTime = time.Now()
+}
+
 func (a *Agent) Run(ctx context.Context, task string) (string, error) {
 	defer a.Close()
+	a.resetRunCounters()
 	if a.config.WallTimeLimit > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(a.config.WallTimeLimit)*time.Second)
@@ -248,7 +273,7 @@ func (a *Agent) query(ctx context.Context) (llm.ORChatResponse, error) {
 	if sw, ok := a.ModelClient.(interface{ SetNativeTools(bool) }); ok {
 		sw.SetNativeTools(a.protocol == protocolNative)
 	}
-	resp, err := a.ModelClient.CompleteText(ctx, a.getMessages())
+	resp, err := a.ModelClient.CompleteText(ctx, a.getMessages(ctx))
 	if err != nil {
 		return llm.ORChatResponse{}, err
 	}
@@ -259,8 +284,26 @@ func (a *Agent) query(ctx context.Context) (llm.ORChatResponse, error) {
 	return resp, nil
 }
 
-func (a *Agent) getMessages() []types.Message {
-	return a.Session.ContextMessages(contextBudget)
+func (a *Agent) contextBudget() int {
+	if a != nil && a.config != nil && a.config.ContextBudget > 0 {
+		return a.config.ContextBudget
+	}
+	return DefaultContextBudget
+}
+
+// getMessages builds the next request from the context budget. When turns are
+// compacted out, it summarizes them into a pinned digest so the model keeps the
+// gist without carrying the full transcript.
+func (a *Agent) getMessages(ctx context.Context) []types.Message {
+	budget := a.contextBudget()
+	msgs, dropped := a.Session.ContextMessagesWithDropped(budget)
+	if len(dropped) > 0 {
+		if summary := a.compactDropped(ctx, dropped); summary != "" {
+			a.Session.InjectSummary(summary)
+			msgs, _ = a.Session.ContextMessagesWithDropped(budget)
+		}
+	}
+	return msgs
 }
 
 func (a *Agent) injectMemory(task string) {
@@ -332,11 +375,19 @@ type modelResponse struct {
 
 func (a *Agent) respond(ctx context.Context) (modelResponse, error) {
 	a.Steps++
+	start := time.Now()
 	resp, err := a.query(ctx)
+	latency := time.Since(start)
 	if err != nil {
 		_ = a.Session.AppendError("model call", err)
 		return modelResponse{}, err
 	}
+	promptTokens, completionTokens := 0, 0
+	if resp.Usage != nil {
+		promptTokens = resp.Usage.PromptTokens
+		completionTokens = resp.Usage.CompletionTokens
+	}
+	_ = a.Session.AppendModelTurn(promptTokens, completionTokens, latency)
 	if len(resp.Choices) == 0 {
 		return modelResponse{}, fmt.Errorf("agent: model response has no choices")
 	}
@@ -446,13 +497,6 @@ func (a *Agent) step(ctx context.Context) (content string, corrective bool, err 
 		return "", false, err
 	}
 	return "", false, nil
-}
-
-func (a *Agent) prepareMessage(message types.Message) []types.Message {
-	if err := a.Session.Append(message); err != nil {
-		return nil
-	}
-	return a.Session.History()
 }
 
 func renderExecution(out types.ExecutionOutput) string {

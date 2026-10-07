@@ -128,13 +128,6 @@ func (b *BashTool) Execute(ctx context.Context, args string) types.ExecutionOutp
 	return out
 }
 
-func (b *BashTool) maxOutput() int {
-	if b.MaxOutput > 0 {
-		return b.MaxOutput
-	}
-	return defaultMaxOutputSize
-}
-
 // exitCode maps exec errors to an exit status; context deadline surfaces
 // as code -1 with a timeout marker so the model can react to hangs.
 func exitCode(err error, ctx context.Context) int {

@@ -89,7 +89,9 @@ type StubbsConfig struct {
 	Theme    string         `yaml:"theme"`
 	Approval ApprovalConfig `yaml:"approval,omitempty"`
 	Memory   MemoryConfig   `yaml:"memory,omitempty"`
-	APIKey   string         `yaml:"-"`
+	// ContextBudgetTokens caps the history sent to the model per request.
+	ContextBudgetTokens int    `yaml:"context_budget_tokens,omitempty"`
+	APIKey              string `yaml:"-"`
 }
 
 // ActiveModel returns the most recently selected model, falling back to the
@@ -123,12 +125,17 @@ func withModel(models []string, model string) []string {
 	return out
 }
 
+// DefaultContextBudgetTokens matches agent.DefaultContextBudget. It is
+// duplicated here to keep config independent of the agent package.
+const DefaultContextBudgetTokens = 32000
+
 func defaultConfig() StubbsConfig {
 	return StubbsConfig{
-		Provider: "openrouter",
-		Env:      "local",
-		Theme:    DefaultTheme,
-		Memory:   defaultMemoryConfig(),
+		Provider:            "openrouter",
+		Env:                 "local",
+		Theme:               DefaultTheme,
+		Memory:              defaultMemoryConfig(),
+		ContextBudgetTokens: DefaultContextBudgetTokens,
 	}
 }
 
@@ -141,13 +148,14 @@ func readConfigFile() StubbsConfig {
 		return cfg
 	}
 	var fileCfg struct {
-		Provider string         `yaml:"provider"`
-		Model    string         `yaml:"model"` // legacy scalar
-		Models   []string       `yaml:"models"`
-		Env      string         `yaml:"env"`
-		Theme    string         `yaml:"theme"`
-		Approval ApprovalConfig `yaml:"approval"`
-		Memory   MemoryConfig   `yaml:"memory"`
+		Provider            string         `yaml:"provider"`
+		Model               string         `yaml:"model"` // legacy scalar
+		Models              []string       `yaml:"models"`
+		Env                 string         `yaml:"env"`
+		Theme               string         `yaml:"theme"`
+		Approval            ApprovalConfig `yaml:"approval"`
+		Memory              MemoryConfig   `yaml:"memory"`
+		ContextBudgetTokens int            `yaml:"context_budget_tokens"`
 	}
 	fileCfg.Memory = defaultMemoryConfig()
 	if err := yaml.Unmarshal(b, &fileCfg); err != nil {
@@ -158,6 +166,7 @@ func readConfigFile() StubbsConfig {
 	cfg.Theme = fileCfg.Theme
 	cfg.Approval = fileCfg.Approval
 	cfg.Memory = fileCfg.Memory
+	cfg.ContextBudgetTokens = fileCfg.ContextBudgetTokens
 	if len(fileCfg.Models) > 0 {
 		cfg.Models = fileCfg.Models
 	} else if fileCfg.Model != "" {
@@ -188,6 +197,9 @@ func fileOrDefaults() StubbsConfig {
 	}
 	if fileCfg.Memory != (MemoryConfig{}) {
 		cfg.Memory = fileCfg.Memory
+	}
+	if fileCfg.ContextBudgetTokens > 0 {
+		cfg.ContextBudgetTokens = fileCfg.ContextBudgetTokens
 	}
 	return cfg
 }

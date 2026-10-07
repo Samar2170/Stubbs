@@ -15,6 +15,7 @@ import (
 	"stubbs/src/env"
 	"stubbs/src/llm"
 	"stubbs/src/memory"
+	"stubbs/src/prompts"
 	"stubbs/src/tools"
 	"stubbs/src/tui"
 	"stubbs/src/types"
@@ -65,6 +66,8 @@ func run() error {
 	versionF := fs.Bool("version", false, "print version and exit")
 	envTimeoutF := fs.Int("env-timeout", env.DefaultTimeout, "per-command tool timeout in seconds")
 	llmTimeoutF := fs.Duration("llm-timeout", defaultLLMTimeout, "timeout for a single model request (0 disables)")
+	contextBudgetF := fs.Int("context-budget", 0, "max context tokens sent per request (0 = config default)")
+	maxCallsF := fs.Int("max-model-calls", 0, "hard cap on model requests per run (0 = no cap)")
 	fs.Parse(os.Args[1:])
 
 	if *versionF {
@@ -152,6 +155,7 @@ func run() error {
 	registry.Register(tools.NewFileWriteTool(workdir))
 	registry.Register(tools.NewFileListTool(workdir))
 	registry.Register(tools.NewFileEditTool(workdir))
+	registry.Register(tools.NewSearchTool(workdir))
 	registry.Register(tools.NewWebFetchTool())
 	if memStore != nil {
 		registry.Register(tools.NewMemoryTool(memStore))
@@ -164,14 +168,26 @@ func run() error {
 		toolNames = append(toolNames, t.Name())
 	}
 
+	// The coding-agent policy comes first, then the harness rules (tool
+	// listing, batching, stop conditions). Kept here so it can become a config
+	// option later.
+	systemPrompt := prompts.CodingAgent + "\n\n" + agent.SystemPromptFor(toolNames)
+
+	contextBudget := cfg.ContextBudgetTokens
+	if *contextBudgetF > 0 {
+		contextBudget = *contextBudgetF
+	}
+
 	iCfg := agent.InteractiveConfig{
 		AgentConfig: agent.AgentConfig{
-			StepLimit:    *stepsF,
-			CostLimit:    float32(*costF),
-			WorkingDir:   workdir,
-			SystemPrompt: agent.SystemPromptFor(toolNames),
-			ToolNames:    toolNames,
-			Memory:       memStore,
+			StepLimit:     *stepsF,
+			CostLimit:     float32(*costF),
+			MaxModelCalls: *maxCallsF,
+			ContextBudget: contextBudget,
+			WorkingDir:    workdir,
+			SystemPrompt:  systemPrompt,
+			ToolNames:     toolNames,
+			Memory:        memStore,
 		},
 		Mode:             mode,
 		WhitelistActions: *whitelistF,
@@ -222,7 +238,7 @@ func run() error {
 			return out, nil
 		},
 		Open: func(id string) ([]types.Message, error) {
-			session, msgs, err := agent.LoadSession(ia.ModelName(), id, agent.SystemPromptFor(toolNames))
+			session, msgs, err := agent.LoadSession(ia.ModelName(), id, systemPrompt)
 			if err != nil {
 				return nil, err
 			}
