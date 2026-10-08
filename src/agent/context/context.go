@@ -50,6 +50,16 @@ func (c *Context) AddTool(content string) {
 	c.History.Add("tool", content)
 }
 
+// AddMessage appends a full message to the history, preserving tool call
+// metadata (id/name/tool_calls) that the flat Add* helpers drop. Tool output is
+// still truncated before it reaches history.
+func (c *Context) AddMessage(msg types.Message) {
+	if msg.Role == types.RoleTool {
+		msg.Content = truncateToolOutput(msg.Content, 8000)
+	}
+	c.History.AddMessage(msg)
+}
+
 func (c *Context) Build() []types.Message {
 	messages := make([]types.Message, 0, 4+len(c.History.Messages))
 	if c.SystemPrompt != "" {
