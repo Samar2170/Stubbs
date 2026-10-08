@@ -124,6 +124,7 @@ func (d *dialog) render(width int, s styles) string {
 		lines = append(lines, helpRows(
 			[2]string{"enter", "submit / select"},
 			[2]string{"@", "attach a file or directory"},
+			[2]string{"tab", "complete slash command"},
 			[2]string{"ctrl+c", "interrupt · quit when done"},
 			[2]string{"esc", "interrupt · cancel"},
 			[2]string{"ctrl+e", "expand input box"},
@@ -133,6 +134,7 @@ func (d *dialog) render(width int, s styles) string {
 		)...)
 		lines = append(lines, "", s.agent.Render("slash commands"))
 		lines = append(lines, helpRows(
+			[2]string{"/", "open the command menu"},
 			[2]string{"/h", "this help"},
 			[2]string{"/u /c /y", "human · confirm · yolo mode"},
 			[2]string{"/models", "switch model"},
