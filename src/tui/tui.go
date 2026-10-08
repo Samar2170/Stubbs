@@ -98,8 +98,7 @@ type Options struct {
 	// Workdir is the root scanned by the @ file/dir picker and the root that
 	// mention paths are resolved against. Empty means the current directory.
 	Workdir string
-	// ReadSecrets allows the @ picker to attach .env-style files, matching
-	// the file_read tool's gate.
+	// ReadSecrets allows the @ picker to attach .env-style files.
 	ReadSecrets bool
 }
 

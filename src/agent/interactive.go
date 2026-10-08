@@ -87,6 +87,9 @@ type InteractiveConfig struct {
 	WhitelistActions []string // regexes; matching commands skip confirmation
 	ConfirmExit      bool
 	AutoQuit         bool
+	// BashConfined reports that bash runs sandboxed (writes confined to the
+	// working directory, network unshared), so its commands skip confirmation.
+	BashConfined bool
 }
 
 type InteractiveAgent struct {
@@ -458,7 +461,7 @@ func (ia *InteractiveAgent) confirmCalls(calls []types.ToolCall) (bool, error) {
 	for _, call := range calls {
 		cmd := CommandOf(call)
 		commands = append(commands, cmd)
-		if !ia.whitelisted(cmd) {
+		if !ia.whitelisted(cmd) && !ia.autoApproved(call) {
 			needsConfirm = true
 		}
 	}
@@ -516,11 +519,15 @@ func (ia *InteractiveAgent) whitelisted(cmd string) bool {
 	return false
 }
 
+// autoApproved reports whether a call can run without confirmation because it
+// is guaranteed to stay inside the working directory. Bash qualifies only when
+// it actually runs sandboxed.
+func (ia *InteractiveAgent) autoApproved(call types.ToolCall) bool {
+	return call.Function.Name == "bash" && ia.cfg.BashConfined
+}
+
 // CommandOf extracts the human-readable command from a tool call.
 func CommandOf(call types.ToolCall) string {
-	if s := fileCommandOf(call); s != "" {
-		return s
-	}
 	var args struct {
 		Command string `json:"command"`
 	}
@@ -528,56 +535,6 @@ func CommandOf(call types.ToolCall) string {
 		return args.Command
 	}
 	return call.Function.Arguments
-}
-
-// fileCommandOf renders a short preview for the file tools so confirmation
-// prompts and whitelist matching do not have to display raw argument JSON.
-func fileCommandOf(call types.ToolCall) string {
-	switch call.Function.Name {
-	case "file_read":
-		var a struct {
-			FilePath string `json:"file_path"`
-		}
-		if json.Unmarshal([]byte(call.Function.Arguments), &a) == nil {
-			return "read " + a.FilePath
-		}
-	case "file_write":
-		var a struct {
-			FilePath string `json:"file_path"`
-			Content  string `json:"content"`
-			Append   bool   `json:"append"`
-		}
-		if json.Unmarshal([]byte(call.Function.Arguments), &a) == nil {
-			verb := "write"
-			if a.Append {
-				verb = "append"
-			}
-			return fmt.Sprintf("%s %s (%d bytes)", verb, a.FilePath, len(a.Content))
-		}
-	case "file_edit":
-		var a struct {
-			FilePath string `json:"file_path"`
-		}
-		if json.Unmarshal([]byte(call.Function.Arguments), &a) == nil {
-			return "edit " + a.FilePath
-		}
-	case "file_list":
-		var a struct {
-			Path      string `json:"path"`
-			Recursive bool   `json:"recursive"`
-		}
-		if json.Unmarshal([]byte(call.Function.Arguments), &a) == nil {
-			p := a.Path
-			if p == "" {
-				p = "."
-			}
-			if a.Recursive {
-				return "list " + p + " (recursive)"
-			}
-			return "list " + p
-		}
-	}
-	return ""
 }
 
 func (ia *InteractiveAgent) finish(content string) (bool, error) {
