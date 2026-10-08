@@ -75,6 +75,8 @@ type styles struct {
 	errStyle lipgloss.Style
 	box      lipgloss.Style
 	boxFocus lipgloss.Style
+	menu     lipgloss.Style // composer slash-command popup
+	cmdName  lipgloss.Style // command token inside the popup
 	dialog   lipgloss.Style
 	option   lipgloss.Style // unselected dialog option
 	sel      lipgloss.Style // selected dialog option
@@ -97,6 +99,8 @@ func newStyles(p palette) styles {
 		box:      lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(p.border),
 		boxFocus: lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(p.accent),
 		dialog:   lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(p.primary).Padding(0, 2),
+		menu:     lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(p.border).Padding(0, 1),
+		cmdName:  fg(p.text).Bold(true),
 		option:   fg(p.muted),
 		sel:      fg(p.badgeFg).Background(p.accent).Bold(true),
 		selLine:  lipgloss.NewStyle().Background(p.muted).Foreground(p.badgeFg),
