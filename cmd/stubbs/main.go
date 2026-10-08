@@ -27,8 +27,8 @@ import (
 )
 
 const (
-	defaultStepLimit = 24
-	defaultCostLimit = 5.0
+	defaultStepLimit = 100
+	defaultCostLimit = 1.0
 )
 
 func main() {
