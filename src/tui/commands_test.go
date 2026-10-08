@@ -19,7 +19,7 @@ func typeKeys(m *model, s string) {
 // menu is live and the memory slash commands are offered.
 func memoryModel() *model {
 	m := testModel()
-	m.app = &App{}
+	m.app = &App{memory: &MemoryHandlers{}}
 	m.pending = &pendingInput{kind: inComment, reply: make(chan inputResult, 1)}
 	return m
 }
@@ -56,7 +56,7 @@ func TestMenuHidesWithoutMemoryHandlers(t *testing.T) {
 		}
 	}
 
-	m.app = &App{}
+	m.app = &App{memory: &MemoryHandlers{List: func() ([]string, error) { return nil, nil }}}
 	m.menu.refresh(m.ta.Value(), m.commands())
 	if len(m.menu.options) != len(m.commands()) {
 		t.Fatal("wired memory handlers should expose the memory commands")

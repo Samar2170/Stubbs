@@ -91,11 +91,16 @@ func (m *model) menuHeight() int {
 	return len(opts) + 2 // rounded border
 }
 
+// menuLimit caps the menu so it never eats the whole transcript viewport.
+// layout() sets inputH and the row budgets before it asks for usedRows(),
+// which is why they are already known here.
 func (m *model) menuLimit() int {
 	if m.h <= 0 {
 		return maxCommandRows
 	}
-	room := m.h - m.inputH - 7 // header+status, composer border, transcript row, menu border
+	// header + transcript row + composer border (2) + menu border (2) + the
+	// rows already budgeted to the status line and pending prompt.
+	room := m.h - m.inputH - 4 - max(m.headerH, 1) - max(m.statusRows, 1) - m.pendingRows
 	return max(1, min(maxCommandRows, room))
 }
 
@@ -132,16 +137,15 @@ func (m *model) commands() []slashCommand {
 		{name: "/c", desc: "confirm mode"},
 		{name: "/y", desc: "yolo mode"},
 	}
-	if m.app == nil {
+	if m.app == nil || m.app.memory == nil {
 		return cmds
 	}
-	return cmds
-	// return append(cmds,
-	// 	slashCommand{name: "/remember", args: "<text>", desc: "save a memory", takesArg: true},
-	// 	slashCommand{name: "/forget", args: "<id|query>", desc: "delete memories", takesArg: true},
-	// 	slashCommand{name: "/memory", desc: "list memories"},
-	// 	slashCommand{name: "/map", desc: "regenerate repo map"},
-	// )
+	return append(cmds,
+		slashCommand{name: "/remember", args: "<text>", desc: "save a memory", takesArg: true},
+		slashCommand{name: "/forget", args: "<id|query>", desc: "delete memories", takesArg: true},
+		slashCommand{name: "/memory", desc: "list memories"},
+		slashCommand{name: "/map", desc: "regenerate repo map"},
+	)
 }
 
 func (m *model) syncMenu() {
