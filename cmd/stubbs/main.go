@@ -112,9 +112,11 @@ func run() error {
 	registry := types.NewRegistry()
 	bashTool := tools.NewBashTool()
 	bashTool.Dir = workdir
+	bashConfined := false
 	if tools.SandboxAvailable("bwrap") {
 		bashTool.Confine = true
 		bashTool.SandboxHome = filepath.Join(config.ProjectDir, "sandbox-home")
+		bashConfined = true
 	} else if _, err := exec.LookPath("bwrap"); err == nil {
 		fmt.Fprintln(os.Stderr, "stubbs: warning: bubblewrap is installed but cannot create sandboxes; running commands unconfined")
 	}
@@ -131,6 +133,7 @@ func run() error {
 		WhitelistActions: *whitelistF,
 		ConfirmExit:      mode == agent.ModeConfirm && !*exitNowF,
 		AutoQuit:         *autoQuitF,
+		BashConfined:     bashConfined,
 	}
 
 	app := tui.New(tui.Options{

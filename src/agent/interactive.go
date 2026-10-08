@@ -87,6 +87,9 @@ type InteractiveConfig struct {
 	WhitelistActions []string // regexes; matching commands skip confirmation
 	ConfirmExit      bool
 	AutoQuit         bool
+	// BashConfined reports that bash runs sandboxed (writes confined to the
+	// working directory, network unshared), so its commands skip confirmation.
+	BashConfined bool
 }
 
 type InteractiveAgent struct {
@@ -458,7 +461,7 @@ func (ia *InteractiveAgent) confirmCalls(calls []types.ToolCall) (bool, error) {
 	for _, call := range calls {
 		cmd := CommandOf(call)
 		commands = append(commands, cmd)
-		if !ia.whitelisted(cmd) {
+		if !ia.whitelisted(cmd) && !ia.autoApproved(call) {
 			needsConfirm = true
 		}
 	}
@@ -514,6 +517,13 @@ func (ia *InteractiveAgent) whitelisted(cmd string) bool {
 		}
 	}
 	return false
+}
+
+// autoApproved reports whether a call can run without confirmation because it
+// is guaranteed to stay inside the working directory. Bash qualifies only when
+// it actually runs sandboxed.
+func (ia *InteractiveAgent) autoApproved(call types.ToolCall) bool {
+	return call.Function.Name == "bash" && ia.cfg.BashConfined
 }
 
 // CommandOf extracts the human-readable command from a tool call.
