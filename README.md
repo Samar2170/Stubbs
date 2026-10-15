@@ -33,7 +33,8 @@ catalog can drive it — including switching models mid-session.
 ## Build
 
 ```bash
-go build -o stubbs ./cmd/stubbs
+go build -o stubbs ./cmd/stubbs        # the coding agent
+go build -o stubbs-chat ./cmd/chat     # the chat app
 ```
 
 ## Setup
@@ -108,14 +109,49 @@ cat issue.txt | ./stubbs -t -
 | `ctrl+e` | Expand/collapse the input box |
 | `ctrl+c` / `esc` | Interrupt the running agent; again to quit |
 
+## Chat
+
+`stubbs-chat` is a separate binary — a conversational app built on the same
+agent loop, LLM client, environment and tool registry as the coding agent,
+but exposing a single **web browsing** tool instead of `bash`. It keeps the
+same config (`.stubbs/`), so the first run reuses the wizard/API key.
+
+```bash
+go build -o stubbs-chat ./cmd/chat
+./stubbs-chat                     # start chatting
+./stubbs-chat -m openai/gpt-4o     # choose a model for this session
+```
+
+Flags: `-m/--model`, `-c/--cost-limit` (default 1), `-s/--step-limit` (model
+steps per turn, default 50), `--config`, `--version`.
+
+In the chat UI:
+
+| Input | Action |
+|---|---|
+| `enter` | send the message |
+| `ctrl+j` | newline |
+| `ctrl+c` / `esc` | stop the current reply (again to quit) |
+| `ctrl+o` | toggle web tool output |
+| `pgup` / `pgdn` | scroll the transcript (mouse wheel works too) |
+| `shift+up` / `shift+down` | scroll one line |
+| `ctrl+home` / `ctrl+end` | jump to the first / latest message |
+| `/clear` | clear the transcript |
+| `/help` | show help |
+
+The transcript follows new messages until you scroll up; a status hint shows
+the scroll position, and returning to the bottom (or `ctrl+end`) resumes
+auto-follow.
+
 ## Architecture
 
 ```
-cmd/stubbs/     CLI entrypoint: flags, config resolution, wiring, run summary
+cmd/stubbs/     Coding-agent CLI entrypoint: flags, config, wiring, summary
+cmd/chat/       Chat-app CLI entrypoint (same internals, web tool only)
 src/agent/      Agent loop, interactive agent (modes, approvals, interrupts),
-                session transcripts, context accounting
+                chat session, session transcripts, context accounting
 src/llm/        OpenRouter client, streaming/retries, model catalog
-src/tools/      BashTool (timeouts, output caps) and the bwrap sandbox
+src/tools/      BashTool (timeouts, output caps), the bwrap sandbox, WebTool
 src/env/        Environment abstraction and local execution
 src/types/      Tool contract, Registry, messages
 src/tui/        Bubble Tea UI, dialogs, mention picker, themes, config wizard

@@ -19,6 +19,9 @@ type AgentConfig struct {
 	StepLimit     int
 	CostLimit     float32
 	WallTimeLimit int
+	// SystemPrompt overrides the default SYSTEM_TEMPLATE for this agent.
+	// Empty uses SYSTEM_TEMPLATE.
+	SystemPrompt string
 }
 
 type Agent struct {
@@ -43,7 +46,11 @@ func NewAgent(cfg *AgentConfig, client llm.ModelClient, environ env.Environment,
 	if client == nil {
 		return nil, fmt.Errorf("agent: client cannot be nil")
 	}
-	s, err := newSession(model, SYSTEM_TEMPLATE)
+	systemPrompt := cfg.SystemPrompt
+	if systemPrompt == "" {
+		systemPrompt = SYSTEM_TEMPLATE
+	}
+	s, err := newSession(model, systemPrompt)
 	if err != nil {
 		return nil, err
 	}
@@ -54,10 +61,10 @@ func NewAgent(cfg *AgentConfig, client llm.ModelClient, environ env.Environment,
 		Environment: environ,
 		StartTime:   time.Now(),
 		Session:     s,
-		Messages:    []types.Message{{Role: types.RoleSystem, Content: SYSTEM_TEMPLATE}},
+		Messages:    []types.Message{{Role: types.RoleSystem, Content: systemPrompt}},
 	}
 	if contextEnabled {
-		a.Context = agentcontext.New(SYSTEM_TEMPLATE, "", modelTokenLimit)
+		a.Context = agentcontext.New(systemPrompt, "", modelTokenLimit)
 	}
 	return a, nil
 }
