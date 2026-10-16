@@ -159,3 +159,23 @@ func clip(s string, maxLines int) string {
 
 // plainWidth is an ANSI-aware display width helper.
 func plainWidth(s string) int { return ansi.StringWidth(s) }
+
+// chatAssistantBlock renders one assistant message in the chat UI: prose plus
+// any tool calls the model queued in the same step.
+type chatAssistantBlock struct {
+	content string
+	calls   []string
+}
+
+func (b chatAssistantBlock) render(width int, s styles) string {
+	s.lastWidth = width
+	var out []string
+	out = append(out, s.agent.Render("stubbs"))
+	if c := strings.TrimSpace(b.content); c != "" {
+		out = append(out, "", c)
+	}
+	for _, call := range b.calls {
+		out = append(out, s.user.Render("→ "+call))
+	}
+	return s.boxed(strings.Join(out, "\n"), s.pal.accent)
+}
