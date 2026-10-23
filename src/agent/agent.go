@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	agentcontext "stubbs/src/agent/context"
 	"stubbs/src/env"
 	"stubbs/src/llm"
 	"stubbs/src/types"
@@ -11,6 +12,8 @@ import (
 )
 
 var SYSTEM_TEMPLATE = "You are a helpful assistant that can interact with a computer."
+
+const modelTokenLimit = 1_000_000
 
 type AgentConfig struct {
 	StepLimit     int
@@ -30,6 +33,7 @@ type Agent struct {
 	Messages    []types.Message
 	Environment env.Environment
 	Session     *Session
+	Context     *agentcontext.Context
 }
 
 func NewAgent(cfg *AgentConfig, client llm.ModelClient, environ env.Environment, model string, contextEnabled bool) (*Agent, error) {
@@ -43,7 +47,7 @@ func NewAgent(cfg *AgentConfig, client llm.ModelClient, environ env.Environment,
 	if err != nil {
 		return nil, err
 	}
-	return &Agent{
+	a := &Agent{
 		config:      cfg,
 		Model:       model,
 		ModelClient: client,
@@ -51,7 +55,11 @@ func NewAgent(cfg *AgentConfig, client llm.ModelClient, environ env.Environment,
 		StartTime:   time.Now(),
 		Session:     s,
 		Messages:    []types.Message{{Role: types.RoleSystem, Content: SYSTEM_TEMPLATE}},
-	}, nil
+	}
+	if contextEnabled {
+		a.Context = agentcontext.New(SYSTEM_TEMPLATE, "", modelTokenLimit)
+	}
+	return a, nil
 }
 
 func (a *Agent) Run(ctx context.Context, task string) (string, error) {
@@ -61,11 +69,14 @@ func (a *Agent) Run(ctx context.Context, task string) (string, error) {
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(a.config.WallTimeLimit)*time.Second)
 		defer cancel()
 	}
-	if err := a.appendMessage(types.Message{Role: "user", Content: task}); err != nil {
+	if err := a.appendTask(task); err != nil {
 		return "", err
 	}
 	var resp string
 	for a.Steps < a.config.StepLimit && (a.config.CostLimit <= 0 || a.Cost <= a.config.CostLimit) {
+		if err := a.compact(ctx); err != nil {
+			return "", err
+		}
 		content, err := a.step(ctx)
 		if err != nil {
 			return "", err
@@ -98,6 +109,49 @@ func (a *Agent) appendMessage(msg types.Message) error {
 		return fmt.Errorf("append to session: %w", err)
 	}
 	a.Messages = append(a.Messages, msg)
+	if a.Context != nil {
+		a.Context.AddMessage(msg)
+	}
+	return nil
+}
+
+// appendTask records the initial task of a run. With context management the
+// task is carried as Context.Task rather than a history entry, so Context.Build
+// does not duplicate it.
+func (a *Agent) appendTask(task string) error {
+	msg := types.Message{Role: types.RoleUser, Content: task}
+	if a.Context != nil {
+		a.Context.Task = task
+		a.Context.State.Goal = task
+	}
+	if err := a.Session.Append(msg); err != nil {
+		return fmt.Errorf("append to session: %w", err)
+	}
+	a.Messages = append(a.Messages, msg)
+	return nil
+}
+
+// compact summarizes and trims the conversation once it grows past the model's
+// usable token budget. It is a no-op unless context management is enabled.
+func (a *Agent) compact(ctx context.Context) error {
+	if a.Context == nil {
+		return nil
+	}
+	if !agentcontext.ShouldCompact(a.Context.Build(), a.Context.ModelTokenLimit, a.Context.CompactionRatio) {
+		return nil
+	}
+	resp, err := a.ModelClient.CompleteText(ctx, a.Context.PrepareForCompaction())
+	if err != nil {
+		return fmt.Errorf("compact context: %w", err)
+	}
+	a.ModelCalls++
+	if resp.Usage != nil {
+		a.Cost += resp.Usage.Cost
+	}
+	if len(resp.Choices) == 0 {
+		return fmt.Errorf("compact context: model response has no choices")
+	}
+	a.Context.ApplySummary(resp.Choices[0].Message.Content)
 	return nil
 }
 
@@ -114,6 +168,9 @@ func (a *Agent) query(ctx context.Context) (llm.ORChatResponse, error) {
 }
 
 func (a *Agent) getMessages() []types.Message {
+	if a.Context != nil {
+		return a.Context.Build()
+	}
 	return a.Messages
 }
 
