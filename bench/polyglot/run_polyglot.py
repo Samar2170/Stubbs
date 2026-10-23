@@ -27,6 +27,7 @@ import os
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -57,10 +58,32 @@ def log(msg: str) -> None:
 
 
 def sh(args: list[str], *, input: bytes | None = None, timeout: float | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(args, input=input, timeout=timeout, capture_output=True)
+    if timeout is None:
+        return subprocess.run(args, input=input, capture_output=True)
+    # Run in its own session so a timeout can reap the whole process group:
+    # `docker exec -t` can leave descendants holding the capture pipes open,
+    # which makes subprocess.run(timeout=...) hang forever after killing the
+    # direct child (observed with a deadlocked agent inside the container).
+    proc = subprocess.Popen(
+        args,
+        stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(input=input, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.communicate()
+        raise
+    return subprocess.CompletedProcess(args, proc.returncode, out, err)
 
 
-def docker(*args: str, timeout: float | None = None) -> subprocess.CompletedProcess:
+def docker(*args: str, timeout: float | None = 120) -> subprocess.CompletedProcess:
     return sh(["docker", *args], timeout=timeout)
 
 
