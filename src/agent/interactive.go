@@ -614,10 +614,11 @@ func (ia *InteractiveAgent) approved(tool string) bool {
 }
 
 // autoApproved reports whether a call is safe enough to skip confirmation.
-// The file tools are auto-approved only under approval.in_workdir; bash is
-// auto-approved whenever it is actually running sandboxed, which is enabled
-// automatically when bubblewrap is available; memory only touches stubbs's own
-// store, so it never needs a prompt.
+// The file tools are path-confined and auto-approved unless
+// approval.in_workdir is explicitly disabled; bash is auto-approved whenever
+// it is actually running sandboxed, which is enabled automatically when
+// bubblewrap is available; memory only touches stubbs's own store, so it never
+// needs a prompt.
 func (ia *InteractiveAgent) autoApproved(call types.ToolCall) bool {
 	switch call.Function.Name {
 	case "read", "write", "edit", "list":

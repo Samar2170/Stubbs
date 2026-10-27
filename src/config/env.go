@@ -34,11 +34,13 @@ func legacyConfigPath() string {
 // this policy entirely. Policies are "allow" or "confirm".
 //
 // InWorkdir auto-approves the file tools (already path-confined to the working
-// directory). Bash does not need this: it is auto-approved whenever it runs
-// inside the bubblewrap sandbox, which is enabled automatically.
+// directory). It defaults to enabled when unset; set it to false to require
+// confirmation for file reads and edits. Bash does not need this: it is
+// auto-approved whenever it runs inside the bubblewrap sandbox, which is
+// enabled automatically.
 type ApprovalConfig struct {
 	Default   string            `yaml:"default,omitempty"`
-	InWorkdir bool              `yaml:"in_workdir,omitempty"`
+	InWorkdir *bool             `yaml:"in_workdir,omitempty"`
 	Tools     map[string]string `yaml:"tools,omitempty"`
 }
 
@@ -46,6 +48,12 @@ const (
 	ApprovalAllow   = "allow"
 	ApprovalConfirm = "confirm"
 )
+
+// InWorkdirEnabled reports whether path-confined file tools may run without
+// confirmation. An unset value means enabled.
+func (a ApprovalConfig) InWorkdirEnabled() bool {
+	return a.InWorkdir == nil || *a.InWorkdir
+}
 
 // PolicyFor returns the approval policy for a tool, defaulting to confirm for
 // unlisted tools and unknown values.
@@ -124,10 +132,12 @@ func withModel(models []string, model string) []string {
 }
 
 func defaultConfig() StubbsConfig {
+	approveInWorkdir := true
 	return StubbsConfig{
 		Provider: "openrouter",
 		Env:      "local",
 		Theme:    DefaultTheme,
+		Approval: ApprovalConfig{InWorkdir: &approveInWorkdir},
 		Memory:   defaultMemoryConfig(),
 	}
 }
@@ -183,7 +193,7 @@ func fileOrDefaults() StubbsConfig {
 	if fileCfg.Theme != "" {
 		cfg.Theme = fileCfg.Theme
 	}
-	if fileCfg.Approval.Default != "" || fileCfg.Approval.InWorkdir || len(fileCfg.Approval.Tools) > 0 {
+	if fileCfg.Approval.Default != "" || fileCfg.Approval.InWorkdir != nil || len(fileCfg.Approval.Tools) > 0 {
 		cfg.Approval = fileCfg.Approval
 	}
 	if fileCfg.Memory != (MemoryConfig{}) {
@@ -303,7 +313,7 @@ func migrateLegacy() {
 func configFileHasSettings() bool {
 	c := readConfigFile()
 	return c.Provider != "" || len(c.Models) > 0 || c.Env != "" || c.Theme != "" ||
-		c.Approval.Default != "" || c.Approval.InWorkdir || len(c.Approval.Tools) > 0
+		c.Approval.Default != "" || c.Approval.InWorkdir != nil || len(c.Approval.Tools) > 0
 }
 
 func writeYAML(path string, cfg StubbsConfig) error {

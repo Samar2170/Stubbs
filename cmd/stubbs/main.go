@@ -135,7 +135,7 @@ func run() error {
 	registry := types.NewRegistry()
 	bashTool := tools.NewBashTool()
 	bashTool.Dir = workdir
-	inWorkdir := cfg.Approval.InWorkdir
+	inWorkdir := cfg.Approval.InWorkdirEnabled()
 	bashConfined := false
 	// Sandbox bash whenever bubblewrap works, regardless of the approval
 	// policy. Writes stay confined to the working directory, which is what

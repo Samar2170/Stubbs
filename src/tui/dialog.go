@@ -197,7 +197,8 @@ func (d *dialog) render(width int, s styles) string {
 			[2]string{"ctrl+e", "expand input box"},
 			[2]string{"ctrl+o", "toggle tool output"},
 			[2]string{"ctrl+j", "newline in input"},
-			[2]string{"mouse", "select text · auto-copies on release"},
+			[2]string{"pgup/pgdn", "scroll output"},
+			[2]string{"mouse", "wheel scrolls · select copies on release"},
 		)...)
 		lines = append(lines, "", s.agent.Render("slash commands"))
 		lines = append(lines, helpRows(

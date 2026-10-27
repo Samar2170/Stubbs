@@ -62,15 +62,34 @@ func TestApprovalInWorkdirPreservedAcrossSaveModel(t *testing.T) {
 	if err := os.WriteFile(ProjectConfigFile, []byte(yaml), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if !Load().Approval.InWorkdir {
+	if !Load().Approval.InWorkdirEnabled() {
 		t.Fatal("in_workdir not loaded")
 	}
 
 	if err := SaveModel("someone/model"); err != nil {
 		t.Fatal(err)
 	}
-	if !Load().Approval.InWorkdir {
+	if !Load().Approval.InWorkdirEnabled() {
 		t.Fatal("in_workdir lost after SaveModel")
+	}
+}
+
+func TestInWorkdirDefaultsEnabled(t *testing.T) {
+	isolate(t)
+
+	if !Load().Approval.InWorkdirEnabled() {
+		t.Fatal("in_workdir should default to enabled")
+	}
+}
+
+func TestInWorkdirCanBeExplicitlyDisabled(t *testing.T) {
+	isolate(t)
+
+	if err := os.WriteFile(ProjectConfigFile, []byte("approval:\n  in_workdir: false\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if Load().Approval.InWorkdirEnabled() {
+		t.Fatal("explicit in_workdir false should disable auto-approval")
 	}
 }
 

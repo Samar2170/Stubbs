@@ -584,22 +584,23 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.MouseMsg:
-		// A modal owns the mouse: the wheel pages the confirm dialog's
-		// command list rather than scrolling the transcript behind it.
+		// A modal owns the wheel only when it has its own content to page (a
+		// long confirm command list). Every other sheet lets the wheel fall
+		// through, so the final output stays readable while the finish sheet
+		// is up.
 		if m.dlg != nil {
 			if d, ok := m.wheelConfirm(msg); ok {
 				return m, d
 			}
-			return m, nil
 		}
 		var cmd tea.Cmd
 		m.vp, cmd = m.vp.Update(msg)
-		if cp := m.handleMouse(msg); cp != nil {
-			cmd = tea.Batch(cmd, cp)
+		if m.dlg == nil {
+			if cp := m.handleMouse(msg); cp != nil {
+				cmd = tea.Batch(cmd, cp)
+			}
 		}
-		if !m.vp.AtBottom() {
-			m.stick = false // the user scrolled up; stop auto-follow
-		}
+		m.updateFollow()
 		return m, cmd
 
 	case tea.KeyMsg:
@@ -613,15 +614,19 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.vp, cmd = m.vp.Update(msg)
 	cmds = append(cmds, cmd)
-	if !m.vp.AtBottom() {
-		m.stick = false // the user scrolled up; stop auto-follow
-	}
+	m.updateFollow()
 	return m, tea.Batch(cmds...)
+}
+
+// updateFollow re-enables auto-follow when a scroll lands at the bottom and
+// suspends it while the user is reading history.
+func (m *model) updateFollow() {
+	m.stick = m.vp.AtBottom()
 }
 
 // wheelConfirm maps a wheel event over the confirm dialog to a viewport page.
 // The ok result is false when the modal is not a scrollable confirm dialog,
-// so the caller can swallow the event without touching the transcript.
+// so the caller can pass the wheel on to the transcript instead.
 func (m *model) wheelConfirm(msg tea.MouseMsg) (tea.Cmd, bool) {
 	if msg.Action != tea.MouseActionPress || m.dlg == nil || m.dlg.kind != dlgConfirm {
 		return nil, false
@@ -693,6 +698,16 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.layout()
 		return m, nil
 
+	case "pgup":
+		m.vp.PageUp()
+		m.updateFollow()
+		return m, nil
+
+	case "pgdown":
+		m.vp.PageDown()
+		m.updateFollow()
+		return m, nil
+
 	case "enter":
 		if m.pending != nil {
 			return m, m.submitPending()
@@ -748,6 +763,14 @@ func (m *model) handleDialogKey(key string) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "enter":
 			return m, m.pickDialogOption()
+		case "pgup":
+			m.vp.PageUp()
+			m.updateFollow()
+			return m, nil
+		case "pgdown":
+			m.vp.PageDown()
+			m.updateFollow()
+			return m, nil
 		case "backspace":
 			if d.filter != "" {
 				d.filter = d.filter[:len(d.filter)-1]
@@ -815,12 +838,16 @@ func (m *model) handleDialogKey(key string) (tea.Model, tea.Cmd) {
 		if n, handled := m.scrollConfirm(-m.dlg.confirmPage()); handled {
 			return m, n
 		}
+		m.vp.PageUp()
+		m.updateFollow()
 		return m, nil
 
 	case "pgdown", "ctrl+f":
 		if n, handled := m.scrollConfirm(m.dlg.confirmPage()); handled {
 			return m, n
 		}
+		m.vp.PageDown()
+		m.updateFollow()
 		return m, nil
 
 	case "home":
