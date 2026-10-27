@@ -160,3 +160,24 @@ func TestCaptureHeuristicIgnoresFailuresAndNonBuilds(t *testing.T) {
 		t.Fatalf("expected no entries, got %+v", entries)
 	}
 }
+
+func TestSummarizeMemorySkipsCanceledContext(t *testing.T) {
+	store, err := memory.NewStore(memory.Options{Dir: t.TempDir(), AutoSummarize: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fc := &fakeCompleter{content: "[]"}
+	a := &Agent{
+		Memory:      store,
+		ModelClient: fc,
+		Session: &Session{Messages: []types.Message{
+			{Role: types.RoleUser, Content: strings.Repeat("please implement the feature. ", 40)},
+		}},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	a.summarizeMemory(ctx)
+	if fc.called {
+		t.Fatal("model should not be called after the run context is canceled")
+	}
+}

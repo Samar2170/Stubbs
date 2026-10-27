@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 )
 
-var DEBUG = true
+var DEBUG = false
 
 var (
 	ProjectDir        string

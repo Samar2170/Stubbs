@@ -33,9 +33,9 @@ func legacyConfigPath() string {
 // requires confirmation unless it is explicitly allowed; yolo mode bypasses
 // this policy entirely. Policies are "allow" or "confirm".
 //
-// InWorkdir auto-approves actions that are guaranteed to stay inside the
-// working directory: the file tools (already path-confined) and bash, which is
-// then run inside a bubblewrap sandbox confined to the working directory.
+// InWorkdir auto-approves the file tools (already path-confined to the working
+// directory). Bash does not need this: it is auto-approved whenever it runs
+// inside the bubblewrap sandbox, which is enabled automatically.
 type ApprovalConfig struct {
 	Default   string            `yaml:"default,omitempty"`
 	InWorkdir bool              `yaml:"in_workdir,omitempty"`

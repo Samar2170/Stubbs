@@ -137,7 +137,10 @@ func run() error {
 	bashTool.Dir = workdir
 	inWorkdir := cfg.Approval.InWorkdir
 	bashConfined := false
-	if inWorkdir && tools.SandboxAvailable("bwrap") {
+	// Sandbox bash whenever bubblewrap works, regardless of the approval
+	// policy. Writes stay confined to the working directory, which is what
+	// lets sandboxed commands skip confirmation below.
+	if tools.SandboxAvailable("bwrap") {
 		bashTool.Confine = true
 		bashTool.SandboxHome = filepath.Join(config.ProjectDir, "sandbox-home")
 		bashConfined = true

@@ -109,6 +109,7 @@ func TestCommandOfFileTools(t *testing.T) {
 func TestConfirmCallsRespectsApproval(t *testing.T) {
 	bashCall := types.ToolCall{Function: types.FunctionCall{Name: "bash", Arguments: `{"command":"ls"}`}}
 	readCall := types.ToolCall{Function: types.FunctionCall{Name: "read", Arguments: `{"file_path":"a.go"}`}}
+	memoryCall := types.ToolCall{Function: types.FunctionCall{Name: "memory", Arguments: `{"action":"add","body":"x"}`}}
 
 	cases := []struct {
 		name         string
@@ -155,6 +156,13 @@ func TestConfirmCallsRespectsApproval(t *testing.T) {
 			wantConfirm: false,
 		},
 		{
+			name:         "confined bash skips prompt without in_workdir",
+			mode:         ModeConfirm,
+			bashConfined: true,
+			calls:        []types.ToolCall{bashCall},
+			wantConfirm:  false,
+		},
+		{
 			name:         "in_workdir skips prompt for confined bash",
 			mode:         ModeConfirm,
 			inWorkdir:    true,
@@ -181,6 +189,19 @@ func TestConfirmCallsRespectsApproval(t *testing.T) {
 			mode:        ModeConfirm,
 			calls:       []types.ToolCall{readCall},
 			wantConfirm: true,
+		},
+		{
+			name:        "memory skips prompt",
+			mode:        ModeConfirm,
+			calls:       []types.ToolCall{memoryCall},
+			wantConfirm: false,
+		},
+		{
+			name:         "memory does not force prompt for confined bash batch",
+			mode:         ModeConfirm,
+			bashConfined: true,
+			calls:        []types.ToolCall{bashCall, memoryCall},
+			wantConfirm:  false,
 		},
 	}
 	for _, tc := range cases {

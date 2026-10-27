@@ -49,7 +49,15 @@ func (a *Agent) summarizeMemory(ctx context.Context) {
 			a.existingMemory(), transcript)},
 	}
 
-	cctx, cancel := context.WithTimeout(context.Background(), memorySummaryTimeout)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	// Derive from the run context so an interrupt or timeout also cancels the
+	// summary request instead of leaving the agent blocked for up to a minute.
+	cctx, cancel := context.WithTimeout(ctx, memorySummaryTimeout)
 	defer cancel()
 
 	content, err := a.completeText(cctx, req)

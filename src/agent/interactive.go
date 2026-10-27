@@ -149,7 +149,7 @@ func (ia *InteractiveAgent) SetModel(model string) {
 	ia.ui.Info("Switched to model %s.", model)
 }
 
-func (ia *InteractiveAgent) Run(ctx context.Context, task string) (string, error) {
+func (ia *InteractiveAgent) Run(ctx context.Context, task string) (submission string, runErr error) {
 	defer ia.Close()
 	a := ia.Agent
 	if a.config.WallTimeLimit > 0 {
@@ -163,7 +163,19 @@ func (ia *InteractiveAgent) Run(ctx context.Context, task string) (string, error
 	}
 	a.ensureRepoMap(ctx)
 	a.injectMemory(task)
-	defer a.summarizeMemory(ctx)
+	// Only summarize a completed run: on abort/interrupt the user wants the
+	// prompt back immediately, not to wait on another model call. The summary
+	// is registered as the active step so a later ctrl-c can cancel it too.
+	defer func() {
+		if runErr != nil {
+			return
+		}
+		sctx, cancel := context.WithCancel(ctx)
+		ia.setStepCancel(cancel)
+		a.summarizeMemory(sctx)
+		ia.setStepCancel(nil)
+		cancel()
+	}()
 	malformedTurns := 0
 	unknownTurns := 0
 	for {
@@ -500,7 +512,7 @@ func (ia *InteractiveAgent) confirmCalls(calls []types.ToolCall) (bool, error) {
 	for _, call := range calls {
 		cmd := CommandOf(call)
 		commands = append(commands, cmd)
-		if !ia.whitelisted(cmd) && !ia.approved(call.Function.Name) && !ia.withinWorkdir(call) {
+		if !ia.whitelisted(cmd) && !ia.approved(call.Function.Name) && !ia.autoApproved(call) {
 			needsConfirm = true
 		}
 	}
@@ -601,19 +613,19 @@ func (ia *InteractiveAgent) approved(tool string) bool {
 	return ia.cfg.Approval[tool] == "allow"
 }
 
-// withinWorkdir reports whether a call is guaranteed to stay inside the working
-// directory: the file tools enforce that themselves, and bash qualifies only
-// when the bash tool is actually running sandboxed there. This backs the
-// approval.in_workdir policy.
-func (ia *InteractiveAgent) withinWorkdir(call types.ToolCall) bool {
-	if !ia.cfg.InWorkdir {
-		return false
-	}
+// autoApproved reports whether a call is safe enough to skip confirmation.
+// The file tools are auto-approved only under approval.in_workdir; bash is
+// auto-approved whenever it is actually running sandboxed, which is enabled
+// automatically when bubblewrap is available; memory only touches stubbs's own
+// store, so it never needs a prompt.
+func (ia *InteractiveAgent) autoApproved(call types.ToolCall) bool {
 	switch call.Function.Name {
 	case "read", "write", "edit", "list":
-		return true
+		return ia.cfg.InWorkdir
 	case "bash":
 		return ia.cfg.BashConfined
+	case "memory":
+		return true
 	}
 	return false
 }

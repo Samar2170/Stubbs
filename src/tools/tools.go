@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strings"
 	"stubbs/src/types"
+	"syscall"
 	"time"
 )
 
@@ -111,6 +112,23 @@ func (b *BashTool) Execute(ctx context.Context, args string) types.ExecutionOutp
 	}
 	cmd := exec.CommandContext(runCtx, argv[0], argv[1:]...)
 	cmd.Dir = runDir
+	// Run the command in its own session/process group so cancellation kills
+	// the whole tree, not just the shell. Otherwise grandchildren survive,
+	// keep the output pipe open, and cmd.Run blocks until they exit — which
+	// makes ctrl-c look like it hung for however long the command runs.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			return err
+		}
+		return nil
+	}
+	// Even if the shell already exited while a background child still holds
+	// the pipe, stop waiting shortly after cancellation.
+	cmd.WaitDelay = 2 * time.Second
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf

@@ -85,7 +85,7 @@ func (s bashSandbox) Command(cmd string) (commandSpec, error) {
 	case "auto", "bwrap":
 		bwrap, lookErr := s.lookPath("bwrap")
 		if lookErr != nil {
-			return commandSpec{}, fmt.Errorf("%w: bubblewrap (bwrap) not found; install it or disable approval.in_workdir", errNoSandbox)
+			return commandSpec{}, fmt.Errorf("%w: bubblewrap (bwrap) not found; install it to sandbox commands", errNoSandbox)
 		}
 		home := strings.TrimSpace(s.Home)
 		if home != "" {
