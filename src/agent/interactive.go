@@ -158,7 +158,7 @@ func (ia *InteractiveAgent) Run(ctx context.Context, task string) (submission st
 		defer cancel()
 	}
 
-	if err := a.appendMessage(types.Message{Role: types.RoleUser, Content: task}); err != nil {
+	if err := a.appendMessage(types.Message{Role: types.RoleUser, Content: ia.expandMentions(task)}); err != nil {
 		return "", err
 	}
 	a.ensureRepoMap(ctx)
@@ -470,6 +470,17 @@ func (ia *InteractiveAgent) promptErr(err error) (bool, error) {
 	return false, err
 }
 
+// expandMentions resolves @file references in user prompts into attached file
+// contents. It uses the agent's working directory so relative paths match the
+// files the tools can see.
+func (ia *InteractiveAgent) expandMentions(text string) string {
+	root := ia.cfg.WorkingDir
+	if ia.Agent != nil && ia.Agent.WorkingDir != "" {
+		root = ia.Agent.WorkingDir
+	}
+	return ExpandFileMentions(text, root)
+}
+
 func (ia *InteractiveAgent) maybeComment() error {
 	if !ia.takeInterrupt() {
 		return nil
@@ -498,7 +509,7 @@ func (ia *InteractiveAgent) interruptComment() error {
 		}
 		return ia.appendMessage(types.Message{
 			Role:    types.RoleUser,
-			Content: fmt.Sprintf("Interrupted by user: %s", text),
+			Content: fmt.Sprintf("Interrupted by user: %s", ia.expandMentions(text)),
 		})
 	}
 }
@@ -552,7 +563,7 @@ func (ia *InteractiveAgent) confirmCalls(calls []types.ToolCall) (bool, error) {
 		default:
 			if err := ia.appendMessage(types.Message{
 				Role:    types.RoleUser,
-				Content: fmt.Sprintf("Commands not executed. The user rejected your commands with the following message: %s", text),
+				Content: fmt.Sprintf("Commands not executed. The user rejected your commands with the following message: %s", ia.expandMentions(text)),
 			}); err != nil {
 				return false, err
 			}
@@ -741,7 +752,7 @@ func (ia *InteractiveAgent) finish(content string) (bool, error) {
 			}
 			if err := ia.appendMessage(types.Message{
 				Role:    types.RoleUser,
-				Content: fmt.Sprintf("The user added a new task: %s", text),
+				Content: fmt.Sprintf("The user added a new task: %s", ia.expandMentions(text)),
 			}); err != nil {
 				return false, err
 			}
@@ -758,6 +769,7 @@ func (ia *InteractiveAgent) printHelp() {
 	ia.ui.Info("/models — browse and switch the active model")
 	ia.ui.Info("/sessions — open a previous session and continue it")
 	ia.ui.Info("/m — expand the input box (multiline editing)")
+	ia.ui.Info("@file — attach a file's contents to your prompt")
 	ia.ui.Info("/h — show this help")
 }
 

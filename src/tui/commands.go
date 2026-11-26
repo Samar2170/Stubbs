@@ -5,6 +5,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
+
+	"stubbs/src/agent"
 )
 
 // slashCommand is one entry in the composer's slash-command menu.
@@ -23,13 +25,21 @@ func (c slashCommand) display() string {
 	return c.name + " " + c.args
 }
 
-// commandMenu is the composer's slash-command popup. It opens when the
-// composer holds a bare "/..." token, filters the registered commands as the
-// user types, and closes as soon as they move on (a space, another word, an
-// empty box).
+type menuMode int
+
+const (
+	menuCommands menuMode = iota
+	menuFiles
+)
+
+// commandMenu is the composer's completion popup. It opens for a leading
+// "/..." token (slash commands) or a trailing "@..." token (file context),
+// filters as the user types, and closes as soon as they move on (a space,
+// another word, an empty box).
 type commandMenu struct {
 	open     bool
-	query    string // the token being typed, e.g. "/rem"
+	mode     menuMode
+	query    string // the token being typed, e.g. "/rem" or "@main"
 	options  []slashCommand
 	selected int
 }
@@ -48,6 +58,7 @@ func (m *commandMenu) refresh(text string, all []slashCommand) {
 	if query != m.query {
 		m.selected = 0
 	}
+	m.mode = menuCommands
 	m.query = query
 	m.options = filterCommands(all, query)
 	m.open = len(m.options) > 0
@@ -56,8 +67,29 @@ func (m *commandMenu) refresh(text string, all []slashCommand) {
 	}
 }
 
+// refreshFiles recomputes the menu from a trailing @token. The file index is
+// supplied by the caller so it can be cached across keystrokes.
+func (m *commandMenu) refreshFiles(text string, files []string) {
+	query, _, ok := mentionQuery(text)
+	if !ok {
+		m.close()
+		return
+	}
+	if query != m.query {
+		m.selected = 0
+	}
+	m.mode = menuFiles
+	m.query = query
+	m.options = filterFiles(files, query)
+	m.open = len(m.options) > 0
+	if m.selected >= len(m.options) {
+		m.selected = 0
+	}
+}
+
 func (m *commandMenu) close() {
 	m.open = false
+	m.mode = menuCommands
 	m.query = ""
 	m.options = nil
 	m.selected = 0
@@ -171,7 +203,29 @@ func (m *model) syncMenu() {
 		m.menu.close()
 		return
 	}
-	m.menu.refresh(m.ta.Value(), m.commands())
+	text := m.ta.Value()
+	if mentionPrompt(m.pending.kind) {
+		if _, _, ok := mentionQuery(text); ok {
+			m.menu.refreshFiles(text, m.fileCandidates())
+			return
+		}
+	}
+	m.menu.refresh(text, m.commands())
+}
+
+// fileCandidates returns the @-mention file index for the working directory.
+// It is rebuilt when a fresh mention menu opens, not on every keystroke, so
+// files created during a session still show up while typing stays responsive.
+func (m *model) fileCandidates() []string {
+	if !m.filesLoaded || m.menu.mode != menuFiles {
+		root := m.opts.Workdir
+		if root == "" {
+			root = "."
+		}
+		m.files = agent.ListFiles(root)
+		m.filesLoaded = true
+	}
+	return m.files
 }
 
 // acceptCommand completes the highlighted command into the composer. Arg-less
@@ -182,6 +236,10 @@ func (m *model) acceptCommand(submit bool) tea.Cmd {
 		return nil
 	}
 	c := m.menu.options[m.menu.selected]
+	if m.menu.mode == menuFiles {
+		m.acceptMention(c)
+		return nil
+	}
 	text := c.name
 	if c.takesArg {
 		text += " "
@@ -194,6 +252,20 @@ func (m *model) acceptCommand(submit bool) tea.Cmd {
 		return m.submitPending()
 	}
 	return nil
+}
+
+// acceptMention replaces the trailing @token with the selected path and adds a
+// space so the user can keep typing. It never submits the prompt.
+func (m *model) acceptMention(c slashCommand) {
+	text := m.ta.Value()
+	_, start, ok := mentionQuery(text)
+	if !ok {
+		return
+	}
+	m.ta.SetValue(text[:start] + c.name + " ")
+	m.ta.CursorEnd()
+	m.syncMenu()
+	m.layout()
 }
 
 // renderMenu draws the popup box, aligned with the composer. The caller places

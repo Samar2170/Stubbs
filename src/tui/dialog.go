@@ -191,7 +191,8 @@ func (d *dialog) render(width int, s styles) string {
 		lines = append(lines, s.agent.Render("keys"))
 		lines = append(lines, helpRows(
 			[2]string{"enter", "submit / select"},
-			[2]string{"tab", "complete slash command"},
+			[2]string{"tab", "complete command or file"},
+			[2]string{"@file", "attach a file as context"},
 			[2]string{"ctrl+c", "interrupt · quit when done"},
 			[2]string{"esc", "interrupt · cancel"},
 			[2]string{"ctrl+e", "expand input box"},

@@ -117,6 +117,7 @@ type Options struct {
 	AutoQuit bool
 	Theme    string
 	Mode     agent.Mode
+	Workdir  string
 }
 
 // MemoryHandlers wires the /remember, /forget, /memory and /map commands.
@@ -393,6 +394,8 @@ type model struct {
 	dlg          *dialog
 	expanded     bool
 	done         bool
+	files        []string
+	filesLoaded  bool
 }
 
 func newTextarea() textarea.Model {
