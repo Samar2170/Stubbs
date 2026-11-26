@@ -132,6 +132,8 @@ func New(opts Options) *App {
 		st:          newStyles(loadTheme(opts.Theme)),
 		mode:        opts.Mode,
 		showTools:   true,
+		selAnchor:   -1,
+		selHead:     -1,
 		workdir:     opts.Workdir,
 		readSecrets: opts.ReadSecrets,
 	}
@@ -345,25 +347,30 @@ type model struct {
 	tLines      []tLine
 	selAnchor   int // selection anchor line (-1 = no selection)
 	selHead     int // selection head line
-	selecting   bool
-	stick       bool // follow the bottom of the transcript
-	showTools   bool // global expand/collapse for tool output (start expanded)
-	dirty       bool
-	vp          viewport.Model
-	ta          textarea.Model
-	sp          spinner.Model
-	status      string
-	statusErr   bool
-	working     bool
-	doneOk      bool
-	mode        agent.Mode
-	steps       int
-	cost        float32
-	pending     *pendingInput
-	menu        commandMenu
-	dlg         *dialog
-	expanded    bool
-	done        bool
+	// selAnchorCol and selHeadCol are display-cell columns within the anchor
+	// and head lines; they turn line-granularity selection into exact spans.
+	selAnchorCol int
+	selHeadCol   int
+	selecting    bool
+	moved        bool // drag moved since the press (distinguishes a click)
+	stick        bool // follow the bottom of the transcript
+	showTools    bool // global expand/collapse for tool output (start expanded)
+	dirty        bool
+	vp           viewport.Model
+	ta           textarea.Model
+	sp           spinner.Model
+	status       string
+	statusErr    bool
+	working      bool
+	doneOk       bool
+	mode         agent.Mode
+	steps        int
+	cost         float32
+	pending      *pendingInput
+	menu         commandMenu
+	dlg          *dialog
+	expanded     bool
+	done         bool
 
 	workdir       string
 	readSecrets   bool
@@ -529,9 +536,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if cp := m.handleMouse(msg); cp != nil {
 			cmd = tea.Batch(cmd, cp)
 		}
-		if !m.vp.AtBottom() {
-			m.stick = false // the user scrolled up; stop auto-follow
-		}
+		m.updateFollow()
 		return m, cmd
 
 	case tea.KeyMsg:
@@ -545,10 +550,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.vp, cmd = m.vp.Update(msg)
 	cmds = append(cmds, cmd)
-	if !m.vp.AtBottom() {
-		m.stick = false // the user scrolled up; stop auto-follow
-	}
+	m.updateFollow()
 	return m, tea.Batch(cmds...)
+}
+
+// updateFollow re-enables auto-follow when a scroll lands at the bottom and
+// suspends it while the user is reading history.
+func (m *model) updateFollow() {
+	m.stick = m.vp.AtBottom()
 }
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -610,6 +619,16 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+e":
 		m.expanded = !m.expanded
 		m.layout()
+		return m, nil
+
+	case "pgup":
+		m.vp.PageUp()
+		m.updateFollow()
+		return m, nil
+
+	case "pgdown":
+		m.vp.PageDown()
+		m.updateFollow()
 		return m, nil
 
 	case "enter":
@@ -675,6 +694,14 @@ func (m *model) handleDialogKey(key string) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "enter":
 			return m, m.pickDialogOption()
+		case "pgup":
+			m.vp.PageUp()
+			m.updateFollow()
+			return m, nil
+		case "pgdown":
+			m.vp.PageDown()
+			m.updateFollow()
+			return m, nil
 		case "backspace":
 			if d.filter != "" {
 				d.filter = d.filter[:len(d.filter)-1]
@@ -714,6 +741,16 @@ func (m *model) handleDialogKey(key string) (tea.Model, tea.Cmd) {
 
 	case "up", "k":
 		d.selected = (d.selected + len(d.options) - 1) % len(d.options)
+		return m, nil
+
+	case "pgup":
+		m.vp.PageUp()
+		m.updateFollow()
+		return m, nil
+
+	case "pgdown":
+		m.vp.PageDown()
+		m.updateFollow()
 		return m, nil
 
 	case "down", "j", "tab":
@@ -1055,49 +1092,155 @@ func (m *model) placeholderFor(kind inputKind) string {
 	return ""
 }
 
+// selPoint is a position in the transcript: a line index and a display-cell
+// column within that line's plain text.
+type selPoint struct {
+	line int
+	col  int
+}
+
 // handleMouse implements select-and-copy over the transcript. A press sets
-// the anchor, a drag moves the head, and a release copies the selected
-// lines. A click without a drag keeps its old meaning: toggle a tool block.
+// the anchor, a drag moves the head, and a release copies the exact selected
+// text. A click without a drag keeps its old meaning: toggle a tool block.
 func (m *model) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	if m.dlg != nil {
 		return nil
 	}
-	row := msg.Y - 1 // -1: header row
-	if row < 0 || row >= m.vp.Height {
-		return nil
-	}
-	line := m.vp.YOffset + row
+	rows := max(m.headerH, 1) // header may wrap to two rows
+	row := msg.Y - rows
 	switch {
 	case msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft:
+		if row < 0 || row >= m.vp.Height {
+			return nil
+		}
+		line := m.vp.YOffset + row
+		if line < 0 || line >= len(m.tLines) {
+			return nil
+		}
+		col := m.colAt(line, msg.X)
 		m.selecting = true
+		m.moved = false
 		m.selAnchor, m.selHead = line, line
+		m.selAnchorCol, m.selHeadCol = col, col
 		m.applySelection()
 
 	case msg.Action == tea.MouseActionMotion && msg.Button == tea.MouseButtonLeft && m.selecting:
-		if line >= 0 && line < len(m.tLines) && line != m.selHead {
-			m.selHead = line
+		line, col := m.selectionPoint(row, msg.X)
+		if line != m.selHead || col != m.selHeadCol {
+			m.selHead, m.selHeadCol = line, col
+			m.moved = true
 			m.applySelection()
 		}
 
 	case msg.Action == tea.MouseActionRelease && msg.Button == tea.MouseButtonLeft && m.selecting:
 		m.selecting = false
 		if m.selAnchor < 0 || m.selAnchor >= len(m.tLines) {
+			m.clearSelection()
 			return nil
 		}
-		if m.selAnchor == m.selHead {
+		line, col := m.selectionPoint(row, msg.X)
+		m.selHead, m.selHeadCol = line, col
+		if !m.moved {
 			line := m.selAnchor // plain click: keep the old toggle behavior
 			m.clearSelection()
 			m.toggleBlockAt(line)
 			return nil
 		}
-		lo, hi := m.selRange()
-		text := m.selectedText(lo, hi)
+		text := m.selectedSpanText()
 		if strings.TrimSpace(text) == "" {
+			m.clearSelection()
 			return nil
 		}
-		return copyCmd(text, hi-lo+1)
+		m.applySelection()
+		return copyCmd(text, strings.Count(text, "\n")+1)
 	}
 	return nil
+}
+
+// selectionPoint maps a viewport row and terminal column to a transcript
+// position, clamping drags that leave the viewport to its first/last line.
+func (m *model) selectionPoint(row, x int) (line, col int) {
+	if len(m.tLines) == 0 {
+		return 0, 0
+	}
+	line = m.vp.YOffset + row
+	if row < 0 {
+		line = m.vp.YOffset
+		x = 0
+	} else if row >= m.vp.Height {
+		line = m.vp.YOffset + m.vp.Height - 1
+		x = m.vp.Width
+	}
+	line = min(max(line, 0), len(m.tLines)-1)
+	return line, m.colAt(line, x)
+}
+
+// colAt clamps a terminal column to the display width of a transcript line.
+func (m *model) colAt(line, x int) int {
+	if line < 0 || line >= len(m.tLines) {
+		return 0
+	}
+	return min(max(x, 0), ansi.StringWidth(m.tLines[line].plain))
+}
+
+// orderedSelection returns the anchor/head pair in reading order, clamped to
+// the current transcript. ok is false when there is no selection.
+func (m *model) orderedSelection() (start, end selPoint, ok bool) {
+	if m.selAnchor < 0 || m.selHead < 0 || len(m.tLines) == 0 {
+		return selPoint{}, selPoint{}, false
+	}
+	start = selPoint{line: m.selAnchor, col: m.selAnchorCol}
+	end = selPoint{line: m.selHead, col: m.selHeadCol}
+	start.line = min(max(start.line, 0), len(m.tLines)-1)
+	end.line = min(max(end.line, 0), len(m.tLines)-1)
+	start.col = m.colAt(start.line, start.col)
+	end.col = m.colAt(end.line, end.col)
+	if end.line < start.line || (end.line == start.line && end.col < start.col) {
+		start, end = end, start
+	}
+	return start, end, true
+}
+
+// lineSpan returns the selected [lo,hi) cell range on transcript line i.
+func (m *model) lineSpan(i int, start, end selPoint) (lo, hi int, ok bool) {
+	if i < start.line || i > end.line {
+		return 0, 0, false
+	}
+	lo = 0
+	if i == start.line {
+		lo = start.col
+	}
+	hi = ansi.StringWidth(m.tLines[i].plain)
+	if i == end.line {
+		hi = end.col
+	}
+	if hi < lo {
+		hi = lo
+	}
+	return lo, hi, true
+}
+
+// selectedSpanText joins the exact selected plain-text substrings.
+func (m *model) selectedSpanText() string {
+	start, end, ok := m.orderedSelection()
+	if !ok {
+		return ""
+	}
+	lines := make([]string, 0, end.line-start.line+1)
+	for i := start.line; i <= end.line; i++ {
+		lo, hi, ok := m.lineSpan(i, start, end)
+		if !ok {
+			continue
+		}
+		lines = append(lines, strings.TrimRight(ansi.Cut(m.tLines[i].plain, lo, hi), " "))
+	}
+	for len(lines) > 0 && lines[0] == "" {
+		lines = lines[1:]
+	}
+	for len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return strings.Join(lines, "\n")
 }
 
 // selRange returns the ordered selection bounds; empty range when inactive.
@@ -1135,6 +1278,9 @@ func (m *model) selectedText(lo, hi int) string {
 
 func (m *model) clearSelection() {
 	m.selAnchor, m.selHead = -1, -1
+	m.selAnchorCol, m.selHeadCol = 0, 0
+	m.selecting = false
+	m.moved = false
 	m.applySelection()
 }
 
@@ -1372,23 +1518,39 @@ func (m *model) renderTranscript() {
 }
 
 // applySelection rebuilds the viewport content from the cached transcript
-// lines, highlighting the selected range. Cheap: no block re-rendering.
+// lines, highlighting only the selected cell range. Cheap: no block
+// re-rendering.
 func (m *model) applySelection() {
 	if len(m.tLines) == 0 {
 		return
 	}
-	lo, hi := m.selRange()
+	start, end, active := m.orderedSelection()
 	parts := make([]string, len(m.tLines))
 	for i, l := range m.tLines {
-		if i >= lo && i <= hi {
+		if !active {
+			parts[i] = l.ansi
+			continue
+		}
+		lo, hi, ok := m.lineSpan(i, start, end)
+		if !ok {
+			parts[i] = l.ansi
+			continue
+		}
+		w := ansi.StringWidth(l.plain)
+		if lo == 0 && hi == w {
 			txt := l.plain
 			if strings.TrimSpace(txt) == "" {
 				txt = " "
 			}
 			parts[i] = m.st.selLine.Render(txt)
-		} else {
-			parts[i] = l.ansi
+			continue
 		}
+		mid := ansi.Cut(l.plain, lo, hi)
+		if mid == "" {
+			parts[i] = l.plain
+			continue
+		}
+		parts[i] = ansi.Cut(l.plain, 0, lo) + m.st.selLine.Render(mid) + ansi.Cut(l.plain, hi, w)
 	}
 	m.vp.SetContent(strings.Join(parts, "\n"))
 }
