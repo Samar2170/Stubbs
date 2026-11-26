@@ -531,6 +531,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.MouseMsg:
+		m.debugMouse(msg)
 		var cmd tea.Cmd
 		m.vp, cmd = m.vp.Update(msg)
 		if cp := m.handleMouse(msg); cp != nil {
@@ -558,6 +559,25 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // suspends it while the user is reading history.
 func (m *model) updateFollow() {
 	m.stick = m.vp.AtBottom()
+}
+
+// debugMouse appends one line per mouse event to the file given by
+// STUBBS_DEBUG_MOUSE. It exists to diagnose real-terminal mouse problems
+// (event encoding, header offsets) that tests cannot reproduce; unset, it
+// costs nothing.
+func (m *model) debugMouse(msg tea.MouseMsg) {
+	path := os.Getenv("STUBBS_DEBUG_MOUSE")
+	if path == "" {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "mouse x=%d y=%d action=%v button=%v type=%v | headerH=%d vpH=%d vpW=%d yOff=%d lines=%d selecting=%v moved=%v\n",
+		msg.X, msg.Y, msg.Action, msg.Button, msg.Type,
+		m.headerH, m.vp.Height, m.vp.Width, m.vp.YOffset, len(m.tLines), m.selecting, m.moved)
 }
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
