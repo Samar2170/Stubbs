@@ -400,6 +400,7 @@ func (m *model) Init() tea.Cmd {
 }
 
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	m.debugEvent(msg)
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
@@ -561,27 +562,53 @@ func (m *model) updateFollow() {
 	m.stick = m.vp.AtBottom()
 }
 
-// debugMouse appends one line per mouse event to the file given by
-// STUBBS_DEBUG_MOUSE. It exists to diagnose real-terminal mouse problems
-// (event encoding, header offsets) that tests cannot reproduce; unset, it
-// costs nothing.
+// debugEvent logs a message entering Update (type plus the fields that
+// matter) to the file given by STUBBS_DEBUG_MOUSE. MouseMsg is skipped here:
+// the mouse case in Update logs it with the full geometry. It exists to
+// diagnose real-terminal mouse problems that tests cannot reproduce;
+// unset, it costs nothing.
+func (m *model) debugEvent(msg tea.Msg) {
+	path := os.Getenv("STUBBS_DEBUG_MOUSE")
+	if path == "" {
+		return
+	}
+	if _, ok := msg.(tea.MouseMsg); ok {
+		return
+	}
+	line := fmt.Sprintf("msg %T", msg)
+	if km, ok := msg.(tea.KeyMsg); ok {
+		line += fmt.Sprintf(" key=%q", km.String())
+	}
+	debugLine(path, line)
+}
+
+// debugMouse logs the decoded mouse event plus the viewport geometry that
+// hit-testing depends on.
 func (m *model) debugMouse(msg tea.MouseMsg) {
 	path := os.Getenv("STUBBS_DEBUG_MOUSE")
 	if path == "" {
 		return
 	}
+	debugLine(path, fmt.Sprintf("mouse x=%d y=%d action=%v button=%v type=%v | headerH=%d vpH=%d vpW=%d yOff=%d lines=%d selecting=%v moved=%v",
+		msg.X, msg.Y, msg.Action, msg.Button, msg.Type,
+		m.headerH, m.vp.Height, m.vp.Width, m.vp.YOffset, len(m.tLines), m.selecting, m.moved))
+}
+
+// debugLine appends one line to the debug file, ignoring I/O errors.
+func debugLine(path, line string) {
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return
 	}
 	defer f.Close()
-	fmt.Fprintf(f, "mouse x=%d y=%d action=%v button=%v type=%v | headerH=%d vpH=%d vpW=%d yOff=%d lines=%d selecting=%v moved=%v\n",
-		msg.X, msg.Y, msg.Action, msg.Button, msg.Type,
-		m.headerH, m.vp.Height, m.vp.Width, m.vp.YOffset, len(m.tLines), m.selecting, m.moved)
+	fmt.Fprintln(f, line)
 }
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.selAnchor >= 0 {
+		if path := os.Getenv("STUBBS_DEBUG_MOUSE"); path != "" {
+			debugLine(path, fmt.Sprintf("clearSelection from handleKey key=%q", msg.String()))
+		}
 		m.clearSelection()
 	}
 	if m.dlg != nil {
@@ -1142,6 +1169,9 @@ func (m *model) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		m.moved = false
 		m.selAnchor, m.selHead = line, line
 		m.selAnchorCol, m.selHeadCol = col, col
+		if path := os.Getenv("STUBBS_DEBUG_MOUSE"); path != "" {
+			debugLine(path, fmt.Sprintf("press accepted: row=%d line=%d col=%d anchor=%d", row, line, col, m.selAnchor))
+		}
 		m.applySelection()
 
 	case msg.Action == tea.MouseActionMotion && msg.Button == tea.MouseButtonLeft && m.selecting:
@@ -1154,6 +1184,9 @@ func (m *model) handleMouse(msg tea.MouseMsg) tea.Cmd {
 
 	case msg.Action == tea.MouseActionRelease && msg.Button == tea.MouseButtonLeft && m.selecting:
 		m.selecting = false
+		if path := os.Getenv("STUBBS_DEBUG_MOUSE"); path != "" {
+			debugLine(path, fmt.Sprintf("release: anchor=%d head=%d moved=%v", m.selAnchor, m.selHead, m.moved))
+		}
 		if m.selAnchor < 0 || m.selAnchor >= len(m.tLines) {
 			m.clearSelection()
 			return nil
