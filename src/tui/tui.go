@@ -1149,10 +1149,10 @@ type selPoint struct {
 // handleMouse implements select-and-copy over the transcript. A press sets
 // the anchor, a drag moves the head, and a release copies the exact selected
 // text. A click without a drag keeps its old meaning: toggle a tool block.
+// Selection works while a modal sheet is up: the sheet renders below the
+// viewport, and the row guards here ignore anything outside the transcript,
+// matching the wheel's behavior of scrolling the output behind the sheet.
 func (m *model) handleMouse(msg tea.MouseMsg) tea.Cmd {
-	if m.dlg != nil {
-		return nil
-	}
 	rows := max(m.headerH, 1) // header may wrap to two rows
 	row := msg.Y - rows
 	switch {

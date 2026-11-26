@@ -64,7 +64,7 @@ func TestMouseSelectEndToEndThroughUpdate(t *testing.T) {
 		t.Fatalf("middle-line highlight %q missing from rendered view:\n%s", want, view)
 	}
 
-	cmd, _ := m.Update(tea.MouseMsg{X: 5, Y: top + 2, Action: tea.MouseActionRelease, Button: tea.MouseButtonLeft})
+	_, cmd := m.Update(tea.MouseMsg{X: 5, Y: top + 2, Action: tea.MouseActionRelease, Button: tea.MouseButtonLeft})
 	if cmd == nil {
 		t.Fatal("release through Update returned no copy command")
 	}
@@ -88,12 +88,59 @@ func TestMouseSelectSurvivesStreamingOutputMidDrag(t *testing.T) {
 	m.dirty = true
 	m.renderTranscript()
 
-	cmd, _ := m.Update(tea.MouseMsg{X: 5, Y: top + 2, Action: tea.MouseActionRelease, Button: tea.MouseButtonLeft})
+	_, cmd := m.Update(tea.MouseMsg{X: 5, Y: top + 2, Action: tea.MouseActionRelease, Button: tea.MouseButtonLeft})
 	if cmd == nil {
 		t.Fatal("streaming output mid-drag swallowed the copy")
 	}
 	if m.selecting {
 		t.Error("release should end the selection")
+	}
+}
+
+// The confirm sheet (and any other modal) renders below the transcript, so
+// drag-select over the output must work with the sheet up — the real-world
+// case of copying the agent's output while it waits for confirmation.
+func TestMouseSelectWorksWhileDialogOpen(t *testing.T) {
+	m := e2eModel(t)
+	m.dlg = &dialog{kind: dlgConfirm, commands: []string{"ls"}, options: confirmOptions()}
+	m.layout()
+	top := m.headerH
+
+	_, _ = m.Update(tea.MouseMsg{X: 0, Y: top, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	if !m.selecting {
+		t.Fatal("press over the transcript must start a selection while the sheet is up")
+	}
+	_, _ = m.Update(tea.MouseMsg{X: 5, Y: top + 2, Action: tea.MouseActionMotion, Button: tea.MouseButtonLeft})
+	if !m.moved {
+		t.Fatal("drag did not move the head while the sheet is up")
+	}
+	if m.dlg == nil {
+		t.Fatal("the sheet should stay open during selection")
+	}
+
+	_, cmd := m.Update(tea.MouseMsg{X: 5, Y: top + 2, Action: tea.MouseActionRelease, Button: tea.MouseButtonLeft})
+	if cmd == nil {
+		t.Fatal("release over the transcript must copy while the sheet is up")
+	}
+	if m.dlg == nil {
+		t.Fatal("the sheet should stay open after the copy")
+	}
+}
+
+// Clicks over the modal sheet itself must not reach the transcript: they
+// land below the viewport and fall outside the press guard.
+func TestMouseClickOverSheetIgnored(t *testing.T) {
+	m := e2eModel(t)
+	m.dlg = &dialog{kind: dlgExit, options: exitOptions()}
+	m.layout()
+	sheetRow := m.headerH + m.vp.Height // first row of the sheet area
+
+	_, cmd := m.Update(tea.MouseMsg{X: 10, Y: sheetRow, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	if m.selecting {
+		t.Fatal("a press over the sheet must not start a selection")
+	}
+	if cmd != nil {
+		t.Fatal("a press over the sheet must not toggle a block")
 	}
 }
 
@@ -111,7 +158,7 @@ func TestMouseSelectSurvivesSpinnerTickMidDrag(t *testing.T) {
 	if cmd != nil && m.stick {
 		t.Log("viewport emitted a follow command during a drag")
 	}
-	rel, _ := m.Update(tea.MouseMsg{X: 5, Y: top + 2, Action: tea.MouseActionRelease, Button: tea.MouseButtonLeft})
+	_, rel := m.Update(tea.MouseMsg{X: 5, Y: top + 2, Action: tea.MouseActionRelease, Button: tea.MouseButtonLeft})
 	if rel == nil {
 		t.Fatal("spinner tick mid-drag swallowed the copy")
 	}
