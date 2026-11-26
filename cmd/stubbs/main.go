@@ -134,6 +134,7 @@ func run() error {
 		ConfirmExit:      mode == agent.ModeConfirm && !*exitNowF,
 		AutoQuit:         *autoQuitF,
 		BashConfined:     bashConfined,
+		Workdir:          workdir,
 	}
 
 	app := tui.New(tui.Options{

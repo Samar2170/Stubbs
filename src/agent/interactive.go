@@ -90,6 +90,9 @@ type InteractiveConfig struct {
 	// BashConfined reports that bash runs sandboxed (writes confined to the
 	// working directory, network unshared), so its commands skip confirmation.
 	BashConfined bool
+	// Workdir is the root against which @file mentions in prompts are
+	// resolved. Empty disables mention expansion.
+	Workdir string
 }
 
 type InteractiveAgent struct {
@@ -158,7 +161,7 @@ func (ia *InteractiveAgent) Run(ctx context.Context, task string) (string, error
 		defer cancel()
 	}
 
-	if err := a.appendMessage(types.Message{Role: types.RoleUser, Content: task}); err != nil {
+	if err := a.appendMessage(types.Message{Role: types.RoleUser, Content: ia.expandMentions(task)}); err != nil {
 		return "", err
 	}
 	for {
@@ -447,7 +450,7 @@ func (ia *InteractiveAgent) interruptComment() error {
 		}
 		return ia.appendMessage(types.Message{
 			Role:    types.RoleUser,
-			Content: fmt.Sprintf("Interrupted by user: %s", text),
+			Content: fmt.Sprintf("Interrupted by user: %s", ia.expandMentions(text)),
 		})
 	}
 }
@@ -501,7 +504,7 @@ func (ia *InteractiveAgent) confirmCalls(calls []types.ToolCall) (bool, error) {
 		default:
 			if err := ia.appendMessage(types.Message{
 				Role:    types.RoleUser,
-				Content: fmt.Sprintf("Commands not executed. The user rejected your commands with the following message: %s", text),
+				Content: fmt.Sprintf("Commands not executed. The user rejected your commands with the following message: %s", ia.expandMentions(text)),
 			}); err != nil {
 				return false, err
 			}
@@ -576,7 +579,7 @@ func (ia *InteractiveAgent) finish(content string) (bool, error) {
 			}
 			if err := ia.appendMessage(types.Message{
 				Role:    types.RoleUser,
-				Content: fmt.Sprintf("The user added a new task: %s", text),
+				Content: fmt.Sprintf("The user added a new task: %s", ia.expandMentions(text)),
 			}); err != nil {
 				return false, err
 			}
@@ -592,7 +595,14 @@ func (ia *InteractiveAgent) printHelp() {
 	ia.ui.Info("/u — switch to human mode (execute commands issued by the user)")
 	ia.ui.Info("/models — browse and switch the active model")
 	ia.ui.Info("/m — expand the input box (multiline editing)")
+	ia.ui.Info("@file — attach a file's contents to your prompt")
 	ia.ui.Info("/h — show this help")
+}
+
+// expandMentions resolves @file references in user prompts into attached file
+// contents, so the model receives the context without spending a tool call.
+func (ia *InteractiveAgent) expandMentions(text string) string {
+	return ExpandFileMentions(text, ia.cfg.Workdir)
 }
 
 func plural(n int, word string) string {

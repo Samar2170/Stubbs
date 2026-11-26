@@ -492,6 +492,141 @@ func TestMouseDragSelectionCopies(t *testing.T) {
 	}
 }
 
+func TestMouseDragSelectsPartialLine(t *testing.T) {
+	m := testModel()
+	m.vp.Width, m.vp.Height = 80, 5
+	m.tLines = []tLine{{plain: "hello world", ansi: "hello world"}}
+	m.applySelection()
+
+	m.handleMouse(tea.MouseMsg{
+		X: 6, Y: 1, Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress, Type: tea.MouseMotion,
+	})
+	m.handleMouse(tea.MouseMsg{
+		X: 11, Y: 1, Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionMotion, Type: tea.MouseMotion,
+	})
+	cmd := m.handleMouse(tea.MouseMsg{
+		X: 11, Y: 1, Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionRelease, Type: tea.MouseMotion,
+	})
+	if cmd == nil {
+		t.Fatal("partial drag-release should return a copy command")
+	}
+	if got := m.selectedSpanText(); got != "world" {
+		t.Errorf("selected span = %q, want %q", got, "world")
+	}
+	want := "hello " + m.st.selLine.Render("world")
+	if view := m.vp.View(); !strings.Contains(view, want) {
+		t.Errorf("selection highlight should cover only the span, got %q", view)
+	}
+}
+
+func TestMouseDragSelectsAcrossLinesAndColumns(t *testing.T) {
+	m := testModel()
+	m.vp.Width, m.vp.Height = 80, 5
+	m.tLines = []tLine{
+		{plain: "alpha beta", ansi: "alpha beta"},
+		{plain: "gamma delta", ansi: "gamma delta"},
+		{plain: "epsilon", ansi: "epsilon"},
+	}
+	m.applySelection()
+
+	drag := func(fromX, fromY, toX, toY int) {
+		m.handleMouse(tea.MouseMsg{
+			X: fromX, Y: fromY, Button: tea.MouseButtonLeft,
+			Action: tea.MouseActionPress, Type: tea.MouseMotion,
+		})
+		m.handleMouse(tea.MouseMsg{
+			X: toX, Y: toY, Button: tea.MouseButtonLeft,
+			Action: tea.MouseActionMotion, Type: tea.MouseMotion,
+		})
+		m.handleMouse(tea.MouseMsg{
+			X: toX, Y: toY, Button: tea.MouseButtonLeft,
+			Action: tea.MouseActionRelease, Type: tea.MouseMotion,
+		})
+	}
+
+	drag(6, 1, 5, 2)
+	if got := m.selectedSpanText(); got != "beta\ngamma" {
+		t.Errorf("forward span = %q, want %q", got, "beta\ngamma")
+	}
+
+	drag(5, 2, 6, 1)
+	if got := m.selectedSpanText(); got != "beta\ngamma" {
+		t.Errorf("reverse span = %q, want %q", got, "beta\ngamma")
+	}
+}
+
+func TestSelectionColumnsClampAndHandleWideChars(t *testing.T) {
+	m := testModel()
+	m.tLines = []tLine{{plain: "a界b", ansi: "a界b"}}
+	m.selAnchor, m.selHead = 0, 0
+	m.selAnchorCol, m.selHeadCol = 1, 3
+	if got := m.selectedSpanText(); got != "界" {
+		t.Errorf("wide-char span = %q, want %q", got, "界")
+	}
+	if got := m.colAt(0, 99); got != 4 {
+		t.Errorf("colAt past the line = %d, want 4", got)
+	}
+	if got := m.colAt(0, -3); got != 0 {
+		t.Errorf("colAt before the line = %d, want 0", got)
+	}
+}
+
+func TestMouseRowsRespectWrappedHeader(t *testing.T) {
+	m := testModel()
+	m.headerH = 2
+	m.vp.Width, m.vp.Height = 80, 10
+	m.vp.YOffset = 3
+	m.tLines = fakeLines(10)
+
+	m.handleMouse(tea.MouseMsg{
+		X: 0, Y: 1, Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress, Type: tea.MouseMotion,
+	})
+	if m.selecting {
+		t.Fatal("a press over the header should not start a selection")
+	}
+
+	m.handleMouse(tea.MouseMsg{
+		X: 0, Y: 3, Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress, Type: tea.MouseMotion,
+	})
+	if m.selAnchor != 4 {
+		t.Errorf("anchor line = %d, want 4 (header 2 + row 1 + offset 3)", m.selAnchor)
+	}
+}
+
+func TestMouseReleaseOutsideViewportStillCopies(t *testing.T) {
+	m := testModel()
+	m.vp.Width, m.vp.Height = 80, 20
+	m.tLines = []tLine{
+		{plain: "one", ansi: "one"},
+		{plain: "two", ansi: "two"},
+	}
+	m.applySelection()
+
+	m.handleMouse(tea.MouseMsg{
+		X: 0, Y: 1, Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionPress, Type: tea.MouseMotion,
+	})
+	m.handleMouse(tea.MouseMsg{
+		X: 0, Y: 50, Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionMotion, Type: tea.MouseMotion,
+	})
+	cmd := m.handleMouse(tea.MouseMsg{
+		X: 0, Y: 50, Button: tea.MouseButtonLeft,
+		Action: tea.MouseActionRelease, Type: tea.MouseMotion,
+	})
+	if cmd == nil {
+		t.Fatal("release below the viewport should still copy")
+	}
+	if got := m.selectedSpanText(); got != "one\ntwo" {
+		t.Errorf("span = %q, want %q", got, "one\ntwo")
+	}
+}
+
 func TestModelsSlashCommandOpensPicker(t *testing.T) {
 	m := testModel()
 	m.app = &App{modelsFn: func() ([]ModelChoice, error) {
